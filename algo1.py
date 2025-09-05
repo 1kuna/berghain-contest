@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import hashlib
 import json
 import multiprocessing
 import os
@@ -220,17 +221,22 @@ def run_game(args: Tuple[int, Dict]) -> Tuple[int, Dict, float]:
 
 # ========== Parameter Management ==========
 def param_hash(params: Dict) -> str:
-    """Generate unique hash for parameter set (optimized with built-in hash)"""
-    # Use tuple hash instead of MD5 for speed
-    key = (
-        round(params['threshold'], 3),
-        round(params.get('early_bonus', 0), 3),
-        round(params.get('ab_bonus', 0), 3),
-        params.get('early_threshold', 800),
-        tuple(round(w, 2) for w in params.get('attr_weights', []))
-    )
-    # Use Python's built-in hash and make it positive
-    return str(abs(hash(key)))[:12]
+    """Generate unique hash for parameter set (deterministic across sessions)"""
+    # Create stable string representation
+    key_parts = [
+        f"t:{params['threshold']:.3f}",
+        f"eb:{params.get('early_bonus', 0):.3f}",
+        f"ab:{params.get('ab_bonus', 0):.3f}",
+        f"et:{params.get('early_threshold', 800)}",
+    ]
+    weights = params.get('attr_weights', [])
+    if weights:
+        weights_str = ','.join(f"{w:.2f}" for w in weights)
+        key_parts.append(f"w:[{weights_str}]")
+    
+    key = '|'.join(key_parts)
+    # Use MD5 for deterministic hashing across sessions
+    return hashlib.md5(key.encode()).hexdigest()[:12]
 
 def generate_grid_params(K: int) -> List[Dict]:
     """Generate comprehensive grid search parameters (with caching)"""
