@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 
 import argparse
-import json
+import json  # Keep for debug logging only
+import orjson  # Fast JSON for state saves
 import multiprocessing
 import os
 import random
@@ -37,10 +38,10 @@ def _get_session():
         _session = requests.Session()
         _session.headers.update({"User-Agent": "berghain_smart_optimizer/4.0"})
         
-        # Add connection pooling for better performance
+        # Connection pool optimized for single worker
         adapter = requests.adapters.HTTPAdapter(
-            pool_connections=10,
-            pool_maxsize=10,
+            pool_connections=2,  # Small pool for single worker
+            pool_maxsize=2,      # Saves memory on Raspberry Pi
             pool_block=False,
             max_retries=0  # We handle retries manually
         )
@@ -162,10 +163,9 @@ def decide(
     return adjusted_pressure < threshold
 
 # ========== Game Runner ==========
-def run_game(args: Tuple[int, Dict]) -> Tuple[int, Dict, float]:
-    """Run a single game and return (rejects, params, timestamp)"""
+def run_game(args: Tuple[int, Dict]) -> Tuple[int, Dict]:
+    """Run a single game and return (rejects, params)"""
     scenario, params = args
-    start_time = time.time()
     
     try:
         # Start game
@@ -210,13 +210,13 @@ def run_game(args: Tuple[int, Dict]) -> Tuple[int, Dict, float]:
         # Return results
         if resp['status'] == 'completed':
             final_rejected = resp.get('rejectedCount', rejected)
-            return final_rejected, params, start_time
+            return final_rejected, params
         else:
-            return MAX_REJECTS, params, start_time
+            return MAX_REJECTS, params
             
     except Exception as e:
         log(f"Game error: {e}")
-        return MAX_REJECTS, params, start_time
+        return MAX_REJECTS, params
 
 # ========== Parameter Management ==========
 def generate_grid_params(K: int) -> List[Dict]:
@@ -299,8 +299,8 @@ class StateManager:
         # Try main state file
         if os.path.exists(self.state_file):
             try:
-                with open(self.state_file, 'r') as f:
-                    state = json.load(f)
+                with open(self.state_file, 'rb') as f:
+                    state = orjson.loads(f.read())
                 if self._validate_state(state):
                     log(f"Loaded state: phase={state.get('phase', 'unknown')}")
                     return state
@@ -310,8 +310,8 @@ class StateManager:
         # Try backup
         if os.path.exists(self.backup_file):
             try:
-                with open(self.backup_file, 'r') as f:
-                    state = json.load(f)
+                with open(self.backup_file, 'rb') as f:
+                    state = orjson.loads(f.read())
                 if self._validate_state(state):
                     log("Recovered from backup")
                     return state
@@ -327,16 +327,16 @@ class StateManager:
         # Update last activity
         state['last_activity'] = time.time()
         
-        # Atomic write using temp file
+        # Atomic write using temp file (orjson is 5-10x faster)
         temp_file = self.state_file + '.tmp'
-        with open(temp_file, 'w') as f:
-            json.dump(state, f, indent=2)
+        with open(temp_file, 'wb') as f:
+            f.write(orjson.dumps(state))
         os.replace(temp_file, self.state_file)
         
         # Periodic backup (every hour)
         if time.time() - self.last_backup > 3600:
-            with open(self.backup_file, 'w') as f:
-                json.dump(state, f, indent=2)
+            with open(self.backup_file, 'wb') as f:
+                f.write(orjson.dumps(state))
             self.last_backup = time.time()
     
     def _validate_state(self, state: Dict) -> bool:
@@ -583,8 +583,7 @@ class SmartOptimizer:
                         'total_count': 0,
                         'best_score': float('inf'),
                         'percentiles': {}
-                    },
-                    'timestamps': []
+                    }
                 }
             
             # Get run count
@@ -669,7 +668,7 @@ class SmartOptimizer:
             pass
         
         # Update state with results
-        for (idx, params), (rejects, _, timestamp) in zip(batch, results):
+        for (idx, params), (rejects, _) in zip(batch, results):
             eval_data = self.state['evaluations'][idx]
             run_summary = eval_data['run_summary']
             
@@ -684,11 +683,6 @@ class SmartOptimizer:
             # Update percentiles
             if len(run_summary['last_100']) >= 5:
                 run_summary['percentiles'] = self._calculate_percentiles(run_summary['last_100'])
-            
-            # Update timestamps
-            eval_data['timestamps'].append(timestamp)
-            if len(eval_data['timestamps']) > 100:
-                eval_data['timestamps'].pop(0)
             
             # Update statistics (full stats for validation)
             stats = calculate_statistics(run_summary['last_100'], detailed=True)
@@ -819,7 +813,7 @@ class SmartOptimizer:
                 pass
             
             # Update evaluations
-            for (idx, _), (rejects, _, timestamp) in zip(top_candidates, results):
+            for (idx, _), (rejects, _) in zip(top_candidates, results):
                 eval_data = self.state['evaluations'][idx]
                 run_summary = eval_data['run_summary']
                 
@@ -832,10 +826,6 @@ class SmartOptimizer:
                 
                 stats = calculate_statistics(run_summary['last_100'], detailed=True)
                 eval_data.update(stats)
-                
-                eval_data['timestamps'].append(timestamp)
-                if len(eval_data['timestamps']) > 100:
-                    eval_data['timestamps'].pop(0)
                 
                 self.state['total_games'] = self.state.get('total_games', 0) + 1
         
@@ -907,7 +897,7 @@ class SmartOptimizer:
             }
             self.state['champion']['run_summary'] = champion_summary
         
-        for rejects, _, timestamp in results:
+        for rejects, _ in results:
             # Update bounded history
             champion_summary['last_500'].append(rejects)
             if len(champion_summary['last_500']) > 500:
