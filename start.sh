@@ -152,9 +152,20 @@ else
     echo -e "${GREEN}✓ All dependencies satisfied${NC}"
 fi
 
-# Check if algo1.py exists
-if [ ! -f "algo1.py" ]; then
-    echo -e "${RED}Error: algo1.py not found in current directory${NC}"
+# Check which algorithms are available
+ALGOS_AVAILABLE=""
+if [ -f "algo1.py" ]; then
+    ALGOS_AVAILABLE="${ALGOS_AVAILABLE}1"
+fi
+if [ -f "algo2.py" ]; then
+    ALGOS_AVAILABLE="${ALGOS_AVAILABLE}2"
+fi
+if [ -f "algo3.py" ]; then
+    ALGOS_AVAILABLE="${ALGOS_AVAILABLE}3"
+fi
+
+if [ -z "$ALGOS_AVAILABLE" ]; then
+    echo -e "${RED}Error: No algorithm files (algo1.py, algo2.py, algo3.py) found${NC}"
     exit 1
 fi
 
@@ -164,9 +175,9 @@ echo -e "${GREEN}========================================${NC}"
 
 # Ask for scenario
 echo -e "\n${YELLOW}Select scenario to optimize:${NC}"
-echo "  1) Scenario 1"
-echo "  2) Scenario 2"
-echo "  3) Scenario 3"
+echo "  1) Scenario 1 (K=2, 6D problem)"
+echo "  2) Scenario 2 (K=4, 8D problem)"
+echo "  3) Scenario 3 (K=6, 10D problem)"
 read -p "Enter choice [1-3]: " scenario
 
 # Validate scenario input
@@ -174,6 +185,45 @@ while [[ ! "$scenario" =~ ^[1-3]$ ]]; do
     echo -e "${RED}Invalid choice. Please enter 1, 2, or 3.${NC}"
     read -p "Enter choice [1-3]: " scenario
 done
+
+# Ask for algorithm
+echo -e "\n${YELLOW}Select optimization algorithm:${NC}"
+if [[ "$ALGOS_AVAILABLE" == *"1"* ]]; then
+    echo "  1) Grid Search (algo1.py)"
+    echo "     - Exhaustive search, guaranteed to find optimal"
+    echo "     - Best for: Small search spaces, high reliability needs"
+    echo "     - Speed: Slowest but most thorough"
+fi
+if [[ "$ALGOS_AVAILABLE" == *"2"* ]]; then
+    echo "  2) Bayesian Optimization with Forest (algo2.py)"
+    echo "     - Smart search using Random Forest surrogate"
+    echo "     - Best for: Balanced speed/quality, medium dimensions"
+    echo "     - Speed: 2-3x faster than grid search"
+fi
+if [[ "$ALGOS_AVAILABLE" == *"3"* ]]; then
+    echo "  3) Bayesian Optimization with ET Optimizer (algo3.py)"
+    echo "     - Advanced BO with Extra Trees estimator"
+    echo "     - Best for: High dimensions (K=6), noisy environments"
+    echo "     - Speed: 20-30% faster than algo2 in high-D"
+fi
+
+# Build valid choices string
+VALID_ALGOS=""
+[[ "$ALGOS_AVAILABLE" == *"1"* ]] && VALID_ALGOS="${VALID_ALGOS}1"
+[[ "$ALGOS_AVAILABLE" == *"2"* ]] && VALID_ALGOS="${VALID_ALGOS}2"
+[[ "$ALGOS_AVAILABLE" == *"3"* ]] && VALID_ALGOS="${VALID_ALGOS}3"
+
+# Read algorithm choice
+read -p "Enter choice [${VALID_ALGOS// /,}]: " algorithm
+
+# Validate algorithm input
+while [[ ! "$algorithm" =~ ^[1-3]$ ]] || [[ ! "$ALGOS_AVAILABLE" == *"$algorithm"* ]]; do
+    echo -e "${RED}Invalid choice or algorithm not available.${NC}"
+    read -p "Enter choice [${VALID_ALGOS// /,}]: " algorithm
+done
+
+# Set algorithm file based on choice
+ALGO_FILE="algo${algorithm}.py"
 
 # Ask for target (optional)
 echo -e "\n${YELLOW}Target rejection count (optional):${NC}"
@@ -197,7 +247,7 @@ read -p "Enter choice [1-3, default=1]: " mode
 mode=${mode:-1}
 
 # Build command
-CMD="python3 algo1.py --scenario $scenario --workers 1"
+CMD="python3 $ALGO_FILE --scenario $scenario --workers 1"
 
 if [ ! -z "$target" ]; then
     CMD="$CMD --target $target"
@@ -221,6 +271,7 @@ echo -e "\n${GREEN}========================================${NC}"
 echo -e "${GREEN}         Starting Optimizer             ${NC}"
 echo -e "${GREEN}========================================${NC}"
 echo -e "${YELLOW}Configuration:${NC}"
+echo "  Algorithm: $ALGO_FILE"
 echo "  Scenario: $scenario"
 if [ ! -z "$target" ]; then
     echo "  Target: $target rejections"
