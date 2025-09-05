@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 
 import argparse
-import hashlib
 import json
 import multiprocessing
 import os
@@ -220,24 +219,6 @@ def run_game(args: Tuple[int, Dict]) -> Tuple[int, Dict, float]:
         return MAX_REJECTS, params, start_time
 
 # ========== Parameter Management ==========
-def param_hash(params: Dict) -> str:
-    """Generate unique hash for parameter set (deterministic across sessions)"""
-    # Create stable string representation
-    key_parts = [
-        f"t:{params['threshold']:.3f}",
-        f"eb:{params.get('early_bonus', 0):.3f}",
-        f"ab:{params.get('ab_bonus', 0):.3f}",
-        f"et:{params.get('early_threshold', 800)}",
-    ]
-    weights = params.get('attr_weights', [])
-    if weights:
-        weights_str = ','.join(f"{w:.2f}" for w in weights)
-        key_parts.append(f"w:[{weights_str}]")
-    
-    key = '|'.join(key_parts)
-    # Use MD5 for deterministic hashing across sessions
-    return hashlib.md5(key.encode()).hexdigest()[:12]
-
 def generate_grid_params(K: int) -> List[Dict]:
     """Generate comprehensive grid search parameters (with caching)"""
     # Check cache first
@@ -589,17 +570,14 @@ class SmartOptimizer:
         else:
             self.state['phase'] = 'improvement'
     
-    def _find_incomplete_grid_params(self) -> List[Tuple[Dict, str]]:
+    def _find_incomplete_grid_params(self) -> List[Tuple[int, Dict]]:
         """Find parameter sets that need more runs"""
         incomplete = []
         
-        for params in self.state['grid_params']:
-            p_hash = param_hash(params)
-            
+        for idx, params in enumerate(self.state['grid_params']):
             # Initialize evaluation if not exists
-            if p_hash not in self.state['evaluations']:
-                self.state['evaluations'][p_hash] = {
-                    'params': params,
+            if idx not in self.state['evaluations']:
+                self.state['evaluations'][idx] = {
                     'run_summary': {
                         'last_100': [],
                         'total_count': 0,
@@ -609,17 +587,13 @@ class SmartOptimizer:
                     'timestamps': []
                 }
             
-            # Handle both old and new format
-            eval_data = self.state['evaluations'][p_hash]
-            if 'run_summary' in eval_data:
-                runs_completed = eval_data['run_summary']['total_count']
-            else:
-                # Old format compatibility
-                runs_completed = len(eval_data.get('runs', []))
+            # Get run count
+            eval_data = self.state['evaluations'][idx]
+            runs_completed = eval_data['run_summary']['total_count']
             
             if runs_completed < MIN_RUNS_PER_PARAM:
                 for _ in range(MIN_RUNS_PER_PARAM - runs_completed):
-                    incomplete.append((params, p_hash))
+                    incomplete.append((idx, params))
         
         return incomplete
     
@@ -637,10 +611,10 @@ class SmartOptimizer:
         batch = incomplete[:batch_size]
         
         # Check if we're testing new parameters
-        if batch and self.state.get('last_params_hash') != batch[0][1]:
-            self.state['last_params_hash'] = batch[0][1]
+        if batch and self.state.get('last_params_idx') != batch[0][0]:
+            self.state['last_params_idx'] = batch[0][0]
             if not self.quiet:
-                log(f"Grid search: Testing parameters (hash: {batch[0][1][:6]}...)")
+                log(f"Grid search: Testing parameter set #{batch[0][0]}")
         
         if not self.quiet:
             log(f"Grid search: Running {batch_size} games...")
@@ -652,7 +626,7 @@ class SmartOptimizer:
             # Use existing pool or run sequentially if workers=1
             if self.workers == 1:
                 # Sequential execution for single worker
-                for params, _ in batch:
+                for idx, params in batch:
                     if self.shutdown_requested:
                         break
                     results.append(run_game((self.scenario, params)))
@@ -663,7 +637,7 @@ class SmartOptimizer:
                 if not self.pool:
                     self.pool = Pool(self.workers)
                 
-                args = [(self.scenario, params) for params, _ in batch]
+                args = [(self.scenario, params) for idx, params in batch]
                 
                 # Use map_async instead of map
                 async_result = self.pool.map_async(run_game, args)
@@ -695,8 +669,8 @@ class SmartOptimizer:
             pass
         
         # Update state with results
-        for (params, p_hash), (rejects, _, timestamp) in zip(batch, results):
-            eval_data = self.state['evaluations'][p_hash]
+        for (idx, params), (rejects, _, timestamp) in zip(batch, results):
+            eval_data = self.state['evaluations'][idx]
             run_summary = eval_data['run_summary']
             
             # Add to bounded history
@@ -744,14 +718,9 @@ class SmartOptimizer:
         """Phase 2: Select champion through statistical validation"""
         # Get candidates with enough runs
         candidates = []
-        for p_hash, eval_data in self.state['evaluations'].items():
-            if 'run_summary' in eval_data:
-                if eval_data['run_summary']['total_count'] >= MIN_RUNS_PER_PARAM:
-                    candidates.append((p_hash, eval_data))
-            elif 'runs' in eval_data:
-                # Old format compatibility
-                if len(eval_data['runs']) >= MIN_RUNS_PER_PARAM:
-                    candidates.append((p_hash, eval_data))
+        for idx, eval_data in self.state['evaluations'].items():
+            if eval_data['run_summary']['total_count'] >= MIN_RUNS_PER_PARAM:
+                candidates.append((idx, eval_data))
         
         if len(candidates) < 10:
             if not self.quiet:
@@ -762,18 +731,14 @@ class SmartOptimizer:
         # Sort by median performance
         candidates.sort(key=lambda x: x[1].get('median', float('inf')))
         
-        best_hash, best_data = candidates[0]
-        second_hash, second_data = candidates[1] if len(candidates) > 1 else (None, None)
+        best_idx, best_data = candidates[0]
+        second_idx, second_data = candidates[1] if len(candidates) > 1 else (None, None)
         
-        # Get run count properly
-        if 'run_summary' in best_data:
-            run_count = best_data['run_summary']['total_count']
-            best_score = best_data['run_summary']['best_score']
-            runs_for_champion = best_data['run_summary']['last_100'].copy()
-        else:
-            run_count = len(best_data['runs'])
-            best_score = min(best_data['runs'])
-            runs_for_champion = best_data['runs'].copy()
+        # Get run count and params from grid
+        run_count = best_data['run_summary']['total_count']
+        best_score = best_data['run_summary']['best_score']
+        runs_for_champion = best_data['run_summary']['last_100'].copy()
+        best_params = self.state['grid_params'][best_idx]
         
         if not self.quiet:
             log(f"Best candidate: median={best_data['median']:.1f}, runs={run_count}")
@@ -782,8 +747,8 @@ class SmartOptimizer:
         if second_data is None or best_data['confidence_95'][1] < second_data['confidence_95'][0]:
             # Clear winner
             self.state['champion'] = {
-                'param_hash': best_hash,
-                'params': best_data['params'],
+                'param_idx': best_idx,
+                'params': best_params,
                 'selection_date': time.time(),
                 'run_summary': {
                     'last_500': runs_for_champion[-500:],
@@ -795,7 +760,7 @@ class SmartOptimizer:
             }
             log(f"🏆 CHAMPION SELECTED: median={best_data['median']:.1f}, best={best_score}")
             if not self.quiet or self.debug:
-                log(f"  Params: {json.dumps(best_data['params'], indent=2)}")
+                log(f"  Params: {json.dumps(best_params, indent=2)}")
             self.state['phase'] = 'improvement'
         else:
             # Too close, run more evaluations on top candidates
@@ -808,7 +773,8 @@ class SmartOptimizer:
                 if not self.pool and self.workers > 1:
                     self.pool = Pool(self.workers)
                 
-                top_params = [candidates[i][1]['params'] for i in range(min(5, len(candidates)))]
+                top_candidates = candidates[:min(5, len(candidates))]
+                top_params = [self.state['grid_params'][idx] for idx, _ in top_candidates]
                 
                 # Handle single worker case
                 if self.workers == 1:
@@ -849,38 +815,27 @@ class SmartOptimizer:
                     self.pool.terminate()
                 return
             finally:
-                if self.pool:
-                    try:
-                        self.pool.close()
-                        self.pool.join(timeout=2)
-                    except:
-                        if self.pool:
-                            self.pool.terminate()
-                    self.pool = None
+                # Keep pool alive for reuse (optimization)
+                pass
             
             # Update evaluations
-            for params, (rejects, _, timestamp) in zip(top_params, results):
-                p_hash = param_hash(params)
-                eval_data = self.state['evaluations'][p_hash]
+            for (idx, _), (rejects, _, timestamp) in zip(top_candidates, results):
+                eval_data = self.state['evaluations'][idx]
+                run_summary = eval_data['run_summary']
                 
-                if 'run_summary' in eval_data:
-                    run_summary = eval_data['run_summary']
-                    run_summary['last_100'].append(rejects)
-                    if len(run_summary['last_100']) > 100:
-                        run_summary['last_100'].pop(0)
-                    run_summary['total_count'] += 1
-                    run_summary['best_score'] = min(run_summary['best_score'], rejects)
-                    run_summary['percentiles'] = self._calculate_percentiles(run_summary['last_100'])
-                    stats = calculate_statistics(run_summary['last_100'], detailed=True)
-                else:
-                    # Old format
-                    eval_data['runs'].append(rejects)
-                    stats = calculate_statistics(eval_data['runs'], detailed=True)
+                run_summary['last_100'].append(rejects)
+                if len(run_summary['last_100']) > 100:
+                    run_summary['last_100'].pop(0)
+                run_summary['total_count'] += 1
+                run_summary['best_score'] = min(run_summary['best_score'], rejects)
+                run_summary['percentiles'] = self._calculate_percentiles(run_summary['last_100'])
+                
+                stats = calculate_statistics(run_summary['last_100'], detailed=True)
+                eval_data.update(stats)
                 
                 eval_data['timestamps'].append(timestamp)
                 if len(eval_data['timestamps']) > 100:
                     eval_data['timestamps'].pop(0)
-                eval_data.update(stats)
                 
                 self.state['total_games'] = self.state.get('total_games', 0) + 1
         
@@ -1005,16 +960,6 @@ class SmartOptimizer:
         
         # Use batch saving for improvement phase
         self._save_state_batch()
-    
-    def _check_new_best(self, p_hash: str, rejects: int) -> bool:
-        """Check if this is a new best result"""
-        current_best = float('inf')
-        for eval_data in self.state['evaluations'].values():
-            if 'run_summary' in eval_data:
-                current_best = min(current_best, eval_data['run_summary']['best_score'])
-            elif 'runs' in eval_data and eval_data['runs']:
-                current_best = min(current_best, min(eval_data['runs']))
-        return rejects < current_best
     
     def _display_progress(self):
         """Display current progress and statistics"""
