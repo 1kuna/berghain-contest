@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 
 import argparse
-import hashlib
 import json
 import multiprocessing
 import os
@@ -32,11 +31,21 @@ def log(msg: str):
 _session = None
 
 def _get_session():
-    """Get or create a session for this process"""
+    """Get or create a session for this process with connection pooling"""
     global _session
     if _session is None:
         _session = requests.Session()
         _session.headers.update({"User-Agent": "berghain_smart_optimizer/4.0"})
+        
+        # Add connection pooling for better performance
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=10,
+            pool_maxsize=10,
+            pool_block=False,
+            max_retries=0  # We handle retries manually
+        )
+        _session.mount('http://', adapter)
+        _session.mount('https://', adapter)
     return _session
 
 # ========== API Functions with Rate Limiting ==========
@@ -59,7 +68,7 @@ def new_game(scenario: int, attempt: int = 0) -> Dict:
         except Exception as e:
             if retry == 2:
                 raise
-            time.sleep(1)
+            time.sleep(0.2)  # Reduced from 1s for faster retries
 
 def decide_and_next(game_id: str, person_index: int, accept: Optional[bool] = None, attempt: int = 0) -> Dict:
     """Make decision and get next person with exponential backoff"""
@@ -82,7 +91,7 @@ def decide_and_next(game_id: str, person_index: int, accept: Optional[bool] = No
         except Exception as e:
             if retry == 2:
                 raise
-            time.sleep(1)
+            time.sleep(0.2)  # Reduced from 1s for faster retries
 
 # ========== Decision Function ==========
 def decide(
@@ -92,58 +101,59 @@ def decide(
     accepted_count: Dict,
     params: Dict
 ) -> bool:
-    """Core decision function with pressure rule and tuneable parameters"""
+    """Core decision function (optimized with numpy and early returns)"""
     S = N - admitted_count
+    
+    # Early return for common cases
+    if S <= 0:
+        return False
+    
     K = len(constraints)
     
-    # Calculate needs
-    needs = []
-    person_attrs = []
-    for c in constraints:
-        attr = c['attribute']
-        needs.append(max(0, c['minCount'] - accepted_count.get(attr, 0)))
-        person_attrs.append(next_person['attributes'].get(attr, False) if next_person else False)
+    # Pre-calculate needs array using numpy for speed
+    needs = np.array([max(0, c['minCount'] - accepted_count.get(c['attribute'], 0)) 
+                      for c in constraints])
     
-    # Guard 1: Greedy finish if all mins met
-    if all(n <= 0 for n in needs):
+    # Fast path: all mins met
+    if not needs.any():
         return True
     
+    # Extract person attributes
+    person_attrs = np.array([next_person['attributes'].get(c['attribute'], False) 
+                              for c in constraints]) if next_person else np.zeros(K, dtype=bool)
+    
     # Guard 2: Must accept if critical for any attr
-    if any(needs[k] == S and person_attrs[k] for k in range(K)):
+    if np.any((needs == S) & person_attrs):
         return True
     
     # Guard 3: Must reject if infeasible
-    sum_missing = sum(needs[k] / max(S, EPS) for k in range(K) if needs[k] > 0 and not person_attrs[k])
+    missing_mask = (needs > 0) & (~person_attrs)
+    sum_missing = np.sum(needs[missing_mask] / max(S, EPS))
     if sum_missing >= 1.0 - EPS:
         return False
     
     # Core pressure calculation with weights
-    weights = params.get('attr_weights', [1.0] * K)
+    weights = np.array(params.get('attr_weights', [1.0] * K))
     if len(weights) != K:
-        weights = [1.0] * K
+        weights = np.ones(K)
     
-    weighted_pressure = sum(
-        (needs[k] / max(S, EPS)) * weights[k] 
-        for k in range(K) 
-        if needs[k] > 0 and not person_attrs[k]
-    )
+    weighted_pressure = np.sum((needs[missing_mask] / max(S, EPS)) * weights[missing_mask])
     
     # Adjustments
     threshold = params['threshold']
     
     # Early game bonus
-    early_bonus = 0.0
-    if S >= params.get('early_threshold', 800):
-        early_bonus = params.get('early_bonus', 0.0)
+    early_bonus = params.get('early_bonus', 0.0) if S >= params.get('early_threshold', 800) else 0.0
     
     # All-attributes bonus
     ab_bonus = 0.0
-    if K == 2 and all(person_attrs):
+    if K == 2 and person_attrs.all():
         ab_bonus = params.get('ab_bonus', 0.0)
     elif K > 2:
-        needed_attrs = sum(1 for k in range(K) if needs[k] > 0)
-        if needed_attrs > 0:
-            coverage = sum(person_attrs[k] for k in range(K) if needs[k] > 0) / needed_attrs
+        needed_mask = needs > 0
+        needed_count = np.sum(needed_mask)
+        if needed_count > 0:
+            coverage = np.sum(person_attrs[needed_mask]) / needed_count
             if coverage >= 0.5:
                 ab_bonus = params.get('ab_bonus', 0.0) * coverage
     
@@ -210,24 +220,25 @@ def run_game(args: Tuple[int, Dict]) -> Tuple[int, Dict, float]:
 
 # ========== Parameter Management ==========
 def param_hash(params: Dict) -> str:
-    """Generate unique hash for parameter set"""
-    # Create stable string representation
-    key_parts = [
-        f"t:{params['threshold']:.3f}",
-        f"eb:{params.get('early_bonus', 0):.3f}",
-        f"ab:{params.get('ab_bonus', 0):.3f}",
-        f"et:{params.get('early_threshold', 800)}",
-    ]
-    weights = params.get('attr_weights', [])
-    if weights:
-        weights_str = ','.join(f"{w:.2f}" for w in weights)
-        key_parts.append(f"w:[{weights_str}]")
-    
-    key = '|'.join(key_parts)
-    return hashlib.md5(key.encode()).hexdigest()[:12]
+    """Generate unique hash for parameter set (optimized with built-in hash)"""
+    # Use tuple hash instead of MD5 for speed
+    key = (
+        round(params['threshold'], 3),
+        round(params.get('early_bonus', 0), 3),
+        round(params.get('ab_bonus', 0), 3),
+        params.get('early_threshold', 800),
+        tuple(round(w, 2) for w in params.get('attr_weights', []))
+    )
+    # Use Python's built-in hash and make it positive
+    return str(abs(hash(key)))[:12]
 
 def generate_grid_params(K: int) -> List[Dict]:
-    """Generate comprehensive grid search parameters"""
+    """Generate comprehensive grid search parameters (with caching)"""
+    # Check cache first
+    cache_key = f"_grid_params_K{K}"
+    if hasattr(generate_grid_params, cache_key):
+        return getattr(generate_grid_params, cache_key).copy()
+    
     params_list = []
     
     thresholds = [0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95, 1.00]
@@ -248,11 +259,13 @@ def generate_grid_params(K: int) -> List[Dict]:
                     }
                     params_list.append(params)
     
+    # Cache result
+    setattr(generate_grid_params, cache_key, params_list)
     return params_list
 
 # ========== Statistical Analysis ==========
-def calculate_statistics(runs: List[int]) -> Dict:
-    """Calculate statistics for a set of runs"""
+def calculate_statistics(runs: List[int], detailed: bool = True) -> Dict:
+    """Calculate statistics for a set of runs (optimized with detailed flag)"""
     if not runs:
         return {
             'mean': float('inf'),
@@ -262,8 +275,14 @@ def calculate_statistics(runs: List[int]) -> Dict:
         }
     
     runs_array = np.array(runs)
-    mean = np.mean(runs_array)
     median = np.median(runs_array)
+    
+    # Fast path: only calculate median when not detailed
+    if not detailed:
+        return {'median': float(median)}
+    
+    # Full statistics for detailed mode
+    mean = np.mean(runs_array)
     std = np.std(runs_array) if len(runs) > 1 else 0
     
     # 95% confidence interval
@@ -377,6 +396,14 @@ class SmartOptimizer:
         self.start_time = self.state.get('start_time', time.time())
         self.games_per_hour = []
         
+        # Batch saving optimization
+        self.games_since_save = 0
+        self.save_interval = 10  # Save every 10 games
+        
+        # Create persistent pool (optimization)
+        if self.workers > 1:
+            self.pool = Pool(self.workers)
+        
         # Set up signal handler
         signal.signal(signal.SIGINT, self._signal_handler)
         
@@ -405,6 +432,15 @@ class SmartOptimizer:
                 pass
             finally:
                 self.pool = None
+    
+    def _save_state_batch(self, force: bool = False, is_best: bool = False):
+        """Save state with batching (reduces I/O overhead)"""
+        self.games_since_save += 1
+        
+        # Save immediately if: forced, new best, or interval reached
+        if force or is_best or self.games_since_save >= self.save_interval:
+            self.state_manager.save_state(self.state)
+            self.games_since_save = 0
     
     def _migrate_state_if_needed(self):
         """Migrate old state format to new bounded format"""
@@ -446,7 +482,7 @@ class SmartOptimizer:
         if migrated:
             if not self.quiet:
                 log("Migrated state to new bounded format")
-            self.state_manager.save_state(self.state)
+            self._save_state_batch(force=True)
     
     def _calculate_percentiles(self, runs: List[int]) -> Dict:
         """Calculate percentiles for a list of runs"""
@@ -501,8 +537,8 @@ class SmartOptimizer:
                     if self.shutdown_requested:
                         break
                     
-                    # Brief pause between batches
-                    time.sleep(0.5)
+                    # Minimal pause between batches (removed to maximize throughput)
+                    # time.sleep(0.1)
                     
                 except KeyboardInterrupt:
                     self.shutdown_requested = True
@@ -523,7 +559,7 @@ class SmartOptimizer:
                     pass
             
             try:
-                self.state_manager.save_state(self.state)
+                self._save_state_batch(force=True)  # Force save on shutdown
                 if not self.quiet:
                     print(f"\n[{time.strftime('%H:%M:%S')}] ✅ State saved. Goodbye!", flush=True)
             except:
@@ -587,7 +623,7 @@ class SmartOptimizer:
         
         if not incomplete:
             self.state['grid_completed'] = True
-            self.state_manager.save_state(self.state)
+            self._save_state_batch(force=True)
             return
         
         # Run batch
@@ -605,28 +641,43 @@ class SmartOptimizer:
         
         # Use pool properly with async
         try:
-            self.pool = Pool(self.workers)
-            args = [(self.scenario, params) for params, _ in batch]
-            
-            # Use map_async instead of map
-            async_result = self.pool.map_async(run_game, args)
             results = []
             
-            # Wait with timeout, checking for shutdown
-            while not self.shutdown_requested:
-                try:
-                    results = async_result.get(timeout=0.5)
-                    break
-                except multiprocessing.TimeoutError:
-                    if async_result.ready():
-                        results = async_result.get()
+            # Use existing pool or run sequentially if workers=1
+            if self.workers == 1:
+                # Sequential execution for single worker
+                for params, _ in batch:
+                    if self.shutdown_requested:
                         break
-                    continue
-            
-            if self.shutdown_requested:
-                if self.pool:
-                    self.pool.terminate()
-                return
+                    results.append(run_game((self.scenario, params)))
+                if self.shutdown_requested:
+                    return
+            else:
+                # Parallel execution with persistent pool
+                if not self.pool:
+                    self.pool = Pool(self.workers)
+                
+                args = [(self.scenario, params) for params, _ in batch]
+                
+                # Use map_async instead of map
+                async_result = self.pool.map_async(run_game, args)
+                
+                # Wait with timeout, checking for shutdown
+                while not self.shutdown_requested:
+                    try:
+                        results = async_result.get(timeout=0.5)
+                        break
+                    except multiprocessing.TimeoutError:
+                        if async_result.ready():
+                            results = async_result.get()
+                            break
+                        continue
+                
+                if self.shutdown_requested:
+                    if self.pool:
+                        self.pool.terminate()
+                        self.pool = None
+                    return
                 
         except (KeyboardInterrupt, SystemExit):
             self.shutdown_requested = True
@@ -634,14 +685,8 @@ class SmartOptimizer:
                 self.pool.terminate()
             return
         finally:
-            if self.pool:
-                try:
-                    self.pool.close()
-                    self.pool.join(timeout=2)
-                except:
-                    if self.pool:
-                        self.pool.terminate()
-                self.pool = None
+            # Keep pool alive for reuse (optimization)
+            pass
         
         # Update state with results
         for (params, p_hash), (rejects, _, timestamp) in zip(batch, results):
@@ -665,14 +710,15 @@ class SmartOptimizer:
             if len(eval_data['timestamps']) > 100:
                 eval_data['timestamps'].pop(0)
             
-            # Update statistics
-            stats = calculate_statistics(run_summary['last_100'])
+            # Update statistics (full stats for validation)
+            stats = calculate_statistics(run_summary['last_100'], detailed=True)
             eval_data.update(stats)
             
             self.state['total_games'] = self.state.get('total_games', 0) + 1
             
             # Check for new global best
-            if rejects < self.state.get('global_best', float('inf')):
+            is_new_global_best = rejects < self.state.get('global_best', float('inf'))
+            if is_new_global_best:
                 self.state['global_best'] = rejects
                 log(f"🔥 NEW GLOBAL BEST: {rejects} rejections!")
                 if self.debug:
@@ -684,8 +730,9 @@ class SmartOptimizer:
                 self.state[phase_best_key] = rejects
                 if not self.quiet:
                     log(f"  NEW GRID BEST: {rejects} (median: {stats['median']:.1f})")
-        
-        self.state_manager.save_state(self.state)
+            
+            # Use batch saving (save on global best or every N games)
+            self._save_state_batch(is_best=is_new_global_best)
     
     def _run_validation(self):
         """Phase 2: Select champion through statistical validation"""
@@ -751,29 +798,44 @@ class SmartOptimizer:
             
             # Run additional evaluations on top 5
             try:
-                self.pool = Pool(self.workers)
+                # Use existing pool or create if needed
+                if not self.pool and self.workers > 1:
+                    self.pool = Pool(self.workers)
+                
                 top_params = [candidates[i][1]['params'] for i in range(min(5, len(candidates)))]
-                args = [(self.scenario, params) for params in top_params]
                 
-                # Use map_async instead of map
-                async_result = self.pool.map_async(run_game, args)
-                results = []
-                
-                # Wait with timeout, checking for shutdown
-                while not self.shutdown_requested:
-                    try:
-                        results = async_result.get(timeout=0.5)
-                        break
-                    except multiprocessing.TimeoutError:
-                        if async_result.ready():
-                            results = async_result.get()
+                # Handle single worker case
+                if self.workers == 1:
+                    results = []
+                    for params in top_params:
+                        if self.shutdown_requested:
                             break
-                        continue
-                
-                if self.shutdown_requested:
-                    if self.pool:
-                        self.pool.terminate()
-                    return
+                        results.append(run_game((self.scenario, params)))
+                    if self.shutdown_requested:
+                        return
+                else:
+                    args = [(self.scenario, params) for params in top_params]
+                    
+                    # Use map_async instead of map
+                    async_result = self.pool.map_async(run_game, args)
+                    results = []
+                    
+                    # Wait with timeout, checking for shutdown
+                    while not self.shutdown_requested:
+                        try:
+                            results = async_result.get(timeout=0.5)
+                            break
+                        except multiprocessing.TimeoutError:
+                            if async_result.ready():
+                                results = async_result.get()
+                                break
+                            continue
+                    
+                    if self.shutdown_requested:
+                        if self.pool:
+                            self.pool.terminate()
+                            self.pool = None
+                        return
                     
             except (KeyboardInterrupt, SystemExit):
                 self.shutdown_requested = True
@@ -803,11 +865,11 @@ class SmartOptimizer:
                     run_summary['total_count'] += 1
                     run_summary['best_score'] = min(run_summary['best_score'], rejects)
                     run_summary['percentiles'] = self._calculate_percentiles(run_summary['last_100'])
-                    stats = calculate_statistics(run_summary['last_100'])
+                    stats = calculate_statistics(run_summary['last_100'], detailed=True)
                 else:
                     # Old format
                     eval_data['runs'].append(rejects)
-                    stats = calculate_statistics(eval_data['runs'])
+                    stats = calculate_statistics(eval_data['runs'], detailed=True)
                 
                 eval_data['timestamps'].append(timestamp)
                 if len(eval_data['timestamps']) > 100:
@@ -816,7 +878,8 @@ class SmartOptimizer:
                 
                 self.state['total_games'] = self.state.get('total_games', 0) + 1
         
-        self.state_manager.save_state(self.state)
+        # Force save after validation phase
+        self._save_state_batch(force=True)
     
     def _run_improvement(self):
         """Phase 3: Run champion indefinitely seeking improvements"""
@@ -830,28 +893,37 @@ class SmartOptimizer:
         
         # Run multiple games in parallel
         try:
-            self.pool = Pool(self.workers)
-            args = [(self.scenario, champion_params) for _ in range(self.workers)]
-            
-            # Use map_async instead of map
-            async_result = self.pool.map_async(run_game, args)
             results = []
             
-            # Wait with timeout, checking for shutdown
-            while not self.shutdown_requested:
-                try:
-                    results = async_result.get(timeout=0.5)
-                    break
-                except multiprocessing.TimeoutError:
-                    if async_result.ready():
-                        results = async_result.get()
+            # Handle single worker case
+            if self.workers == 1:
+                results = [run_game((self.scenario, champion_params))]
+            else:
+                # Use existing pool or create if needed
+                if not self.pool:
+                    self.pool = Pool(self.workers)
+                
+                args = [(self.scenario, champion_params) for _ in range(self.workers)]
+                
+                # Use map_async instead of map
+                async_result = self.pool.map_async(run_game, args)
+                
+                # Wait with timeout, checking for shutdown
+                while not self.shutdown_requested:
+                    try:
+                        results = async_result.get(timeout=0.5)
                         break
-                    continue
-            
-            if self.shutdown_requested:
-                if self.pool:
-                    self.pool.terminate()
-                return
+                    except multiprocessing.TimeoutError:
+                        if async_result.ready():
+                            results = async_result.get()
+                            break
+                        continue
+                
+                if self.shutdown_requested:
+                    if self.pool:
+                        self.pool.terminate()
+                        self.pool = None
+                    return
                 
         except (KeyboardInterrupt, SystemExit):
             self.shutdown_requested = True
@@ -859,14 +931,8 @@ class SmartOptimizer:
                 self.pool.terminate()
             return
         finally:
-            if self.pool:
-                try:
-                    self.pool.close()
-                    self.pool.join(timeout=2)
-                except:
-                    if self.pool:
-                        self.pool.terminate()
-                self.pool = None
+            # Keep pool alive for reuse (optimization)
+            pass
         
         # Update champion stats
         champion_summary = self.state['champion'].get('run_summary')
@@ -908,6 +974,8 @@ class SmartOptimizer:
                 
                 if self.target and rejects <= self.target:
                     log(f"🎯 TARGET {self.target} ACHIEVED WITH {rejects}!")
+                    # Force save on target achievement
+                    self._save_state_batch(force=True)
         
         # Update percentiles
         if len(champion_summary['last_500']) >= 5:
@@ -929,7 +997,8 @@ class SmartOptimizer:
                     f"Global best={self.state.get('global_best', 'N/A')}, "
                     f"Recent median={recent_median:.1f}")
         
-        self.state_manager.save_state(self.state)
+        # Use batch saving for improvement phase
+        self._save_state_batch()
     
     def _check_new_best(self, p_hash: str, rejects: int) -> bool:
         """Check if this is a new best result"""
