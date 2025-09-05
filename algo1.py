@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
-import json  # Keep for debug logging only
-import orjson  # Fast JSON for state saves
+import json
 import multiprocessing
 import os
 import random
@@ -299,8 +298,8 @@ class StateManager:
         # Try main state file
         if os.path.exists(self.state_file):
             try:
-                with open(self.state_file, 'rb') as f:
-                    state = orjson.loads(f.read())
+                with open(self.state_file, 'r') as f:
+                    state = json.load(f)
                 if self._validate_state(state):
                     log(f"Loaded state: phase={state.get('phase', 'unknown')}")
                     return state
@@ -310,8 +309,8 @@ class StateManager:
         # Try backup
         if os.path.exists(self.backup_file):
             try:
-                with open(self.backup_file, 'rb') as f:
-                    state = orjson.loads(f.read())
+                with open(self.backup_file, 'r') as f:
+                    state = json.load(f)
                 if self._validate_state(state):
                     log("Recovered from backup")
                     return state
@@ -327,16 +326,16 @@ class StateManager:
         # Update last activity
         state['last_activity'] = time.time()
         
-        # Atomic write using temp file (orjson is 5-10x faster)
+        # Atomic write using temp file
         temp_file = self.state_file + '.tmp'
-        with open(temp_file, 'wb') as f:
-            f.write(orjson.dumps(state))
+        with open(temp_file, 'w') as f:
+            json.dump(state, f, indent=2)
         os.replace(temp_file, self.state_file)
         
         # Periodic backup (every hour)
         if time.time() - self.last_backup > 3600:
-            with open(self.backup_file, 'wb') as f:
-                f.write(orjson.dumps(state))
+            with open(self.backup_file, 'w') as f:
+                json.dump(state, f, indent=2)
             self.last_backup = time.time()
     
     def _validate_state(self, state: Dict) -> bool:
@@ -385,7 +384,7 @@ class SmartOptimizer:
         
         # Batch saving optimization
         self.games_since_save = 0
-        self.save_interval = 10  # Save every 10 games
+        self.save_interval = 5  # Save every 5 games
         
         # Create persistent pool (optimization)
         if self.workers > 1:
