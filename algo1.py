@@ -431,8 +431,8 @@ def main():
             }
             log(f"Running with default params: {params}")
         
-        rejects, _ = run_game((args.scenario, params))
-        log(f"Result: {rejects} rejects")
+        rejects, _, actual_K = run_game((args.scenario, params))
+        log(f"Result: {rejects} rejects (K={actual_K})")
     
     elif args.mode == "tune":
         # Tune single scenario
