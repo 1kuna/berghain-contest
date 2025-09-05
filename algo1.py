@@ -576,8 +576,9 @@ class SmartOptimizer:
         
         for idx, params in enumerate(self.state['grid_params']):
             # Initialize evaluation if not exists
-            if idx not in self.state['evaluations']:
-                self.state['evaluations'][idx] = {
+            idx_str = str(idx)  # orjson requires string keys
+            if idx_str not in self.state['evaluations']:
+                self.state['evaluations'][idx_str] = {
                     'run_summary': {
                         'last_100': [],
                         'total_count': 0,
@@ -587,7 +588,7 @@ class SmartOptimizer:
                 }
             
             # Get run count
-            eval_data = self.state['evaluations'][idx]
+            eval_data = self.state['evaluations'][idx_str]
             runs_completed = eval_data['run_summary']['total_count']
             
             if runs_completed < MIN_RUNS_PER_PARAM:
@@ -669,7 +670,7 @@ class SmartOptimizer:
         
         # Update state with results
         for (idx, params), (rejects, _) in zip(batch, results):
-            eval_data = self.state['evaluations'][idx]
+            eval_data = self.state['evaluations'][str(idx)]  # orjson requires string keys
             run_summary = eval_data['run_summary']
             
             # Add to bounded history
@@ -712,9 +713,9 @@ class SmartOptimizer:
         """Phase 2: Select champion through statistical validation"""
         # Get candidates with enough runs
         candidates = []
-        for idx, eval_data in self.state['evaluations'].items():
+        for idx_str, eval_data in self.state['evaluations'].items():
             if eval_data['run_summary']['total_count'] >= MIN_RUNS_PER_PARAM:
-                candidates.append((idx, eval_data))
+                candidates.append((int(idx_str), eval_data))  # Convert back to int for indexing
         
         if len(candidates) < 10:
             if not self.quiet:
@@ -814,7 +815,7 @@ class SmartOptimizer:
             
             # Update evaluations
             for (idx, _), (rejects, _) in zip(top_candidates, results):
-                eval_data = self.state['evaluations'][idx]
+                eval_data = self.state['evaluations'][str(idx)]  # orjson requires string keys
                 run_summary = eval_data['run_summary']
                 
                 run_summary['last_100'].append(rejects)
