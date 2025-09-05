@@ -3,9 +3,12 @@
 import argparse
 import hashlib
 import json
+import multiprocessing
 import os
 import random
 import requests
+import signal
+import sys
 import time
 import numpy as np
 from multiprocessing import Pool
@@ -359,56 +362,174 @@ class StateManager:
 
 # ========== Smart Optimizer ==========
 class SmartOptimizer:
-    def __init__(self, scenario: int, workers: int = 4, target: Optional[int] = None):
+    def __init__(self, scenario: int, workers: int = 4, target: Optional[int] = None, debug: bool = False, quiet: bool = False):
         self.scenario = scenario
         self.workers = workers
         self.target = target
+        self.debug = debug
+        self.quiet = quiet
         self.state_manager = StateManager(scenario)
         self.state = self.state_manager.load_state()
+        self.pool = None  # Track pool for cleanup
+        self.shutdown_requested = False
         
         # Performance tracking
         self.start_time = self.state.get('start_time', time.time())
         self.games_per_hour = []
         
+        # Set up signal handler
+        signal.signal(signal.SIGINT, self._signal_handler)
+        
+        # Migrate old state format if needed
+        self._migrate_state_if_needed()
+    
+    def __del__(self):
+        """Cleanup pools on destruction"""
+        self._cleanup_pool()
+    
+    def _signal_handler(self, signum, frame):
+        """Handle shutdown signals"""
+        self.shutdown_requested = True
+        if self.pool:
+            self.pool.terminate()  # Immediately terminate pool
+        if not self.quiet:
+            print(f"\n[{time.strftime('%H:%M:%S')}] 🛑 Shutdown requested, cleaning up...", flush=True)
+    
+    def _cleanup_pool(self):
+        """Clean up any active pool"""
+        if self.pool:
+            try:
+                self.pool.terminate()
+                self.pool.join(timeout=2)
+            except:
+                pass
+            finally:
+                self.pool = None
+    
+    def _migrate_state_if_needed(self):
+        """Migrate old state format to new bounded format"""
+        migrated = False
+        
+        # Migrate evaluations
+        for p_hash, eval_data in self.state.get('evaluations', {}).items():
+            if 'runs' in eval_data and 'run_summary' not in eval_data:
+                runs = eval_data['runs']
+                eval_data['run_summary'] = {
+                    'last_100': runs[-100:] if len(runs) > 100 else runs.copy(),
+                    'total_count': len(runs),
+                    'best_score': min(runs) if runs else float('inf'),
+                    'percentiles': self._calculate_percentiles(runs) if runs else {}
+                }
+                del eval_data['runs']
+                migrated = True
+        
+        # Migrate champion
+        if self.state.get('champion') and 'all_runs' in self.state['champion']:
+            all_runs = self.state['champion']['all_runs']
+            self.state['champion']['run_summary'] = {
+                'last_500': all_runs[-500:] if len(all_runs) > 500 else all_runs.copy(),
+                'total_count': len(all_runs),
+                'best_score': min(all_runs) if all_runs else float('inf'),
+                'percentiles': self._calculate_percentiles(all_runs) if all_runs else {}
+            }
+            del self.state['champion']['all_runs']
+            migrated = True
+        
+        # Track global best
+        if 'global_best' not in self.state:
+            self.state['global_best'] = float('inf')
+            for eval_data in self.state.get('evaluations', {}).values():
+                if 'run_summary' in eval_data:
+                    self.state['global_best'] = min(self.state['global_best'], eval_data['run_summary']['best_score'])
+            migrated = True
+        
+        if migrated:
+            if not self.quiet:
+                log("Migrated state to new bounded format")
+            self.state_manager.save_state(self.state)
+    
+    def _calculate_percentiles(self, runs: List[int]) -> Dict:
+        """Calculate percentiles for a list of runs"""
+        if not runs:
+            return {}
+        arr = np.array(runs)
+        return {
+            'p25': float(np.percentile(arr, 25)),
+            'p50': float(np.percentile(arr, 50)),
+            'p75': float(np.percentile(arr, 75)),
+            'p90': float(np.percentile(arr, 90)),
+            'p95': float(np.percentile(arr, 95))
+        }
+        
     def run_forever(self):
         """Main loop that runs indefinitely"""
-        log(f"Smart Optimizer for Scenario {self.scenario}")
-        log(f"Target: {self.target if self.target else 'Not set (will run forever)'}")
-        log(f"Workers: {self.workers}")
-        log("="*60)
+        if not self.quiet:
+            log(f"Smart Optimizer for Scenario {self.scenario}")
+            log(f"Target: {self.target if self.target else 'Not set (will run forever)'}")
+            log(f"Workers: {self.workers}")
+            if self.debug:
+                log(f"Debug mode: ON")
+            log("="*60)
         
-        while True:
+        try:
+            while not self.shutdown_requested:
+                try:
+                    # Update phase based on state
+                    self._update_phase()
+                    
+                    # Display progress
+                    self._display_progress()
+                    
+                    # Execute current phase
+                    if self.state['phase'] == 'grid_search':
+                        self._run_grid_search()
+                    elif self.state['phase'] == 'validation':
+                        self._run_validation()
+                    elif self.state['phase'] == 'improvement':
+                        self._run_improvement()
+                    
+                    # Check target achievement
+                    if self.target and self.state.get('champion'):
+                        champion_summary = self.state['champion'].get('run_summary')
+                        if champion_summary:
+                            best_run = champion_summary.get('best_score', float('inf'))
+                            if best_run <= self.target:
+                                if not self.quiet:
+                                    log(f"🎯 TARGET {self.target} ACHIEVED WITH {best_run}!")
+                    
+                    # Check for shutdown
+                    if self.shutdown_requested:
+                        break
+                    
+                    # Brief pause between batches
+                    time.sleep(0.5)
+                    
+                except KeyboardInterrupt:
+                    self.shutdown_requested = True
+                    break
+                except Exception as e:
+                    log(f"Error in main loop: {e}")
+                    if self.debug:
+                        import traceback
+                        traceback.print_exc()
+                    time.sleep(5)
+        finally:
+            # Cleanup
+            if self.pool:
+                try:
+                    self.pool.terminate()  # Force terminate
+                    self.pool.join(timeout=1)
+                except:
+                    pass
+            
             try:
-                # Update phase based on state
-                self._update_phase()
-                
-                # Display progress
-                self._display_progress()
-                
-                # Execute current phase
-                if self.state['phase'] == 'grid_search':
-                    self._run_grid_search()
-                elif self.state['phase'] == 'validation':
-                    self._run_validation()
-                elif self.state['phase'] == 'improvement':
-                    self._run_improvement()
-                
-                # Check target achievement
-                if self.target and self.state.get('champion'):
-                    best_run = min(self.state['champion'].get('all_runs', [float('inf')]))
-                    if best_run <= self.target:
-                        log(f"🎯 TARGET {self.target} ACHIEVED WITH {best_run}!")
-                
-                # Brief pause between batches
-                time.sleep(0.5)
-                
-            except KeyboardInterrupt:
-                log("\nGracefully shutting down...")
                 self.state_manager.save_state(self.state)
-                break
-            except Exception as e:
-                log(f"Error in main loop: {e}")
-                time.sleep(5)
+                if not self.quiet:
+                    print(f"\n[{time.strftime('%H:%M:%S')}] ✅ State saved. Goodbye!", flush=True)
+            except:
+                pass
+            
+            os._exit(0)  # Force exit
     
     def _update_phase(self):
         """Determine current phase from state"""
@@ -437,11 +558,23 @@ class SmartOptimizer:
             if p_hash not in self.state['evaluations']:
                 self.state['evaluations'][p_hash] = {
                     'params': params,
-                    'runs': [],
+                    'run_summary': {
+                        'last_100': [],
+                        'total_count': 0,
+                        'best_score': float('inf'),
+                        'percentiles': {}
+                    },
                     'timestamps': []
                 }
             
-            runs_completed = len(self.state['evaluations'][p_hash]['runs'])
+            # Handle both old and new format
+            eval_data = self.state['evaluations'][p_hash]
+            if 'run_summary' in eval_data:
+                runs_completed = eval_data['run_summary']['total_count']
+            else:
+                # Old format compatibility
+                runs_completed = len(eval_data.get('runs', []))
+            
             if runs_completed < MIN_RUNS_PER_PARAM:
                 for _ in range(MIN_RUNS_PER_PARAM - runs_completed):
                     incomplete.append((params, p_hash))
@@ -461,40 +594,115 @@ class SmartOptimizer:
         batch_size = min(self.workers, len(incomplete))
         batch = incomplete[:batch_size]
         
-        log(f"Grid search: Running {batch_size} games...")
+        # Check if we're testing new parameters
+        if batch and self.state.get('last_params_hash') != batch[0][1]:
+            self.state['last_params_hash'] = batch[0][1]
+            if not self.quiet:
+                log(f"Grid search: Testing parameters (hash: {batch[0][1][:6]}...)")
         
-        with Pool(self.workers) as pool:
+        if not self.quiet:
+            log(f"Grid search: Running {batch_size} games...")
+        
+        # Use pool properly with async
+        try:
+            self.pool = Pool(self.workers)
             args = [(self.scenario, params) for params, _ in batch]
-            results = pool.map(run_game, args)
+            
+            # Use map_async instead of map
+            async_result = self.pool.map_async(run_game, args)
+            results = []
+            
+            # Wait with timeout, checking for shutdown
+            while not self.shutdown_requested:
+                try:
+                    results = async_result.get(timeout=0.5)
+                    break
+                except multiprocessing.TimeoutError:
+                    if async_result.ready():
+                        results = async_result.get()
+                        break
+                    continue
+            
+            if self.shutdown_requested:
+                if self.pool:
+                    self.pool.terminate()
+                return
+                
+        except (KeyboardInterrupt, SystemExit):
+            self.shutdown_requested = True
+            if self.pool:
+                self.pool.terminate()
+            return
+        finally:
+            if self.pool:
+                try:
+                    self.pool.close()
+                    self.pool.join(timeout=2)
+                except:
+                    if self.pool:
+                        self.pool.terminate()
+                self.pool = None
         
         # Update state with results
         for (params, p_hash), (rejects, _, timestamp) in zip(batch, results):
-            self.state['evaluations'][p_hash]['runs'].append(rejects)
-            self.state['evaluations'][p_hash]['timestamps'].append(timestamp)
+            eval_data = self.state['evaluations'][p_hash]
+            run_summary = eval_data['run_summary']
+            
+            # Add to bounded history
+            run_summary['last_100'].append(rejects)
+            if len(run_summary['last_100']) > 100:
+                run_summary['last_100'].pop(0)
+            
+            run_summary['total_count'] += 1
+            run_summary['best_score'] = min(run_summary['best_score'], rejects)
+            
+            # Update percentiles
+            if len(run_summary['last_100']) >= 5:
+                run_summary['percentiles'] = self._calculate_percentiles(run_summary['last_100'])
+            
+            # Update timestamps
+            eval_data['timestamps'].append(timestamp)
+            if len(eval_data['timestamps']) > 100:
+                eval_data['timestamps'].pop(0)
             
             # Update statistics
-            stats = calculate_statistics(self.state['evaluations'][p_hash]['runs'])
-            self.state['evaluations'][p_hash].update(stats)
+            stats = calculate_statistics(run_summary['last_100'])
+            eval_data.update(stats)
             
             self.state['total_games'] = self.state.get('total_games', 0) + 1
             
-            # Check if this is a new best
-            if self._check_new_best(p_hash, rejects):
-                log(f"  NEW GRID BEST: {rejects} (median: {stats['median']:.1f})")
+            # Check for new global best
+            if rejects < self.state.get('global_best', float('inf')):
+                self.state['global_best'] = rejects
+                log(f"🔥 NEW GLOBAL BEST: {rejects} rejections!")
+                if self.debug:
+                    log(f"   Params: {json.dumps(params, indent=2)}")
+            
+            # Check for new phase best
+            phase_best_key = f'{self.state["phase"]}_best'
+            if rejects < self.state.get(phase_best_key, float('inf')):
+                self.state[phase_best_key] = rejects
+                if not self.quiet:
+                    log(f"  NEW GRID BEST: {rejects} (median: {stats['median']:.1f})")
         
         self.state_manager.save_state(self.state)
     
     def _run_validation(self):
         """Phase 2: Select champion through statistical validation"""
         # Get candidates with enough runs
-        candidates = [
-            (p_hash, eval_data)
-            for p_hash, eval_data in self.state['evaluations'].items()
-            if len(eval_data['runs']) >= MIN_RUNS_PER_PARAM
-        ]
+        candidates = []
+        for p_hash, eval_data in self.state['evaluations'].items():
+            if 'run_summary' in eval_data:
+                if eval_data['run_summary']['total_count'] >= MIN_RUNS_PER_PARAM:
+                    candidates.append((p_hash, eval_data))
+            elif 'runs' in eval_data:
+                # Old format compatibility
+                if len(eval_data['runs']) >= MIN_RUNS_PER_PARAM:
+                    candidates.append((p_hash, eval_data))
         
         if len(candidates) < 10:
-            log("Not enough candidates for validation, continuing grid search...")
+            if not self.quiet:
+                log("Not enough candidates for validation, continuing grid search...")
             self.state['grid_completed'] = False
             return
         
@@ -504,7 +712,18 @@ class SmartOptimizer:
         best_hash, best_data = candidates[0]
         second_hash, second_data = candidates[1] if len(candidates) > 1 else (None, None)
         
-        log(f"Best candidate: median={best_data['median']:.1f}, runs={len(best_data['runs'])}")
+        # Get run count properly
+        if 'run_summary' in best_data:
+            run_count = best_data['run_summary']['total_count']
+            best_score = best_data['run_summary']['best_score']
+            runs_for_champion = best_data['run_summary']['last_100'].copy()
+        else:
+            run_count = len(best_data['runs'])
+            best_score = min(best_data['runs'])
+            runs_for_champion = best_data['runs'].copy()
+        
+        if not self.quiet:
+            log(f"Best candidate: median={best_data['median']:.1f}, runs={run_count}")
         
         # Check statistical significance
         if second_data is None or best_data['confidence_95'][1] < second_data['confidence_95'][0]:
@@ -513,30 +732,88 @@ class SmartOptimizer:
                 'param_hash': best_hash,
                 'params': best_data['params'],
                 'selection_date': time.time(),
-                'all_runs': best_data['runs'].copy(),
-                'best_single_run': min(best_data['runs']),
-                'recent_performance': best_data['runs'][-20:]
+                'run_summary': {
+                    'last_500': runs_for_champion[-500:],
+                    'total_count': len(runs_for_champion),
+                    'best_score': best_score,
+                    'percentiles': self._calculate_percentiles(runs_for_champion)
+                },
+                'recent_performance': runs_for_champion[-20:]
             }
-            log(f"CHAMPION SELECTED: median={best_data['median']:.1f}, best={min(best_data['runs'])}")
-            log(f"  Params: {json.dumps(best_data['params'], indent=2)}")
+            log(f"🏆 CHAMPION SELECTED: median={best_data['median']:.1f}, best={best_score}")
+            if not self.quiet or self.debug:
+                log(f"  Params: {json.dumps(best_data['params'], indent=2)}")
             self.state['phase'] = 'improvement'
         else:
             # Too close, run more evaluations on top candidates
-            log("Top candidates too close, running more evaluations...")
+            if not self.quiet:
+                log("Top candidates too close, running more evaluations...")
             
             # Run additional evaluations on top 5
-            with Pool(self.workers) as pool:
+            try:
+                self.pool = Pool(self.workers)
                 top_params = [candidates[i][1]['params'] for i in range(min(5, len(candidates)))]
                 args = [(self.scenario, params) for params in top_params]
-                results = pool.map(run_game, args)
+                
+                # Use map_async instead of map
+                async_result = self.pool.map_async(run_game, args)
+                results = []
+                
+                # Wait with timeout, checking for shutdown
+                while not self.shutdown_requested:
+                    try:
+                        results = async_result.get(timeout=0.5)
+                        break
+                    except multiprocessing.TimeoutError:
+                        if async_result.ready():
+                            results = async_result.get()
+                            break
+                        continue
+                
+                if self.shutdown_requested:
+                    if self.pool:
+                        self.pool.terminate()
+                    return
+                    
+            except (KeyboardInterrupt, SystemExit):
+                self.shutdown_requested = True
+                if self.pool:
+                    self.pool.terminate()
+                return
+            finally:
+                if self.pool:
+                    try:
+                        self.pool.close()
+                        self.pool.join(timeout=2)
+                    except:
+                        if self.pool:
+                            self.pool.terminate()
+                    self.pool = None
             
             # Update evaluations
             for params, (rejects, _, timestamp) in zip(top_params, results):
                 p_hash = param_hash(params)
-                self.state['evaluations'][p_hash]['runs'].append(rejects)
-                self.state['evaluations'][p_hash]['timestamps'].append(timestamp)
-                stats = calculate_statistics(self.state['evaluations'][p_hash]['runs'])
-                self.state['evaluations'][p_hash].update(stats)
+                eval_data = self.state['evaluations'][p_hash]
+                
+                if 'run_summary' in eval_data:
+                    run_summary = eval_data['run_summary']
+                    run_summary['last_100'].append(rejects)
+                    if len(run_summary['last_100']) > 100:
+                        run_summary['last_100'].pop(0)
+                    run_summary['total_count'] += 1
+                    run_summary['best_score'] = min(run_summary['best_score'], rejects)
+                    run_summary['percentiles'] = self._calculate_percentiles(run_summary['last_100'])
+                    stats = calculate_statistics(run_summary['last_100'])
+                else:
+                    # Old format
+                    eval_data['runs'].append(rejects)
+                    stats = calculate_statistics(eval_data['runs'])
+                
+                eval_data['timestamps'].append(timestamp)
+                if len(eval_data['timestamps']) > 100:
+                    eval_data['timestamps'].pop(0)
+                eval_data.update(stats)
+                
                 self.state['total_games'] = self.state.get('total_games', 0) + 1
         
         self.state_manager.save_state(self.state)
@@ -544,38 +821,113 @@ class SmartOptimizer:
     def _run_improvement(self):
         """Phase 3: Run champion indefinitely seeking improvements"""
         if not self.state['champion']:
-            log("No champion selected, returning to validation")
+            if not self.quiet:
+                log("No champion selected, returning to validation")
             self.state['phase'] = 'validation'
             return
         
         champion_params = self.state['champion']['params']
         
         # Run multiple games in parallel
-        with Pool(self.workers) as pool:
+        try:
+            self.pool = Pool(self.workers)
             args = [(self.scenario, champion_params) for _ in range(self.workers)]
-            results = pool.map(run_game, args)
+            
+            # Use map_async instead of map
+            async_result = self.pool.map_async(run_game, args)
+            results = []
+            
+            # Wait with timeout, checking for shutdown
+            while not self.shutdown_requested:
+                try:
+                    results = async_result.get(timeout=0.5)
+                    break
+                except multiprocessing.TimeoutError:
+                    if async_result.ready():
+                        results = async_result.get()
+                        break
+                    continue
+            
+            if self.shutdown_requested:
+                if self.pool:
+                    self.pool.terminate()
+                return
+                
+        except (KeyboardInterrupt, SystemExit):
+            self.shutdown_requested = True
+            if self.pool:
+                self.pool.terminate()
+            return
+        finally:
+            if self.pool:
+                try:
+                    self.pool.close()
+                    self.pool.join(timeout=2)
+                except:
+                    if self.pool:
+                        self.pool.terminate()
+                self.pool = None
         
         # Update champion stats
+        champion_summary = self.state['champion'].get('run_summary')
+        if not champion_summary:
+            # Initialize if missing (migration case)
+            champion_summary = {
+                'last_500': [],
+                'total_count': 0,
+                'best_score': float('inf'),
+                'percentiles': {}
+            }
+            self.state['champion']['run_summary'] = champion_summary
+        
         for rejects, _, timestamp in results:
-            self.state['champion']['all_runs'].append(rejects)
+            # Update bounded history
+            champion_summary['last_500'].append(rejects)
+            if len(champion_summary['last_500']) > 500:
+                champion_summary['last_500'].pop(0)
+            
+            champion_summary['total_count'] += 1
+            
+            # Update recent performance
             self.state['champion']['recent_performance'].append(rejects)
             if len(self.state['champion']['recent_performance']) > 20:
                 self.state['champion']['recent_performance'].pop(0)
             
             self.state['total_games'] = self.state.get('total_games', 0) + 1
             
-            if rejects < self.state['champion']['best_single_run']:
-                self.state['champion']['best_single_run'] = rejects
-                total_runs = len(self.state['champion']['all_runs'])
-                log(f"🚀 NEW BEST SCORE: {rejects} (run #{total_runs})")
+            # Check for improvement
+            if rejects < champion_summary['best_score']:
+                champion_summary['best_score'] = rejects
+                total_runs = champion_summary['total_count']
+                log(f"🚀 NEW CHAMPION BEST: {rejects} (run #{total_runs})")
+                
+                # Check global best
+                if rejects < self.state.get('global_best', float('inf')):
+                    self.state['global_best'] = rejects
+                    log(f"🔥 NEW GLOBAL BEST: {rejects} rejections!")
                 
                 if self.target and rejects <= self.target:
                     log(f"🎯 TARGET {self.target} ACHIEVED WITH {rejects}!")
         
+        # Update percentiles
+        if len(champion_summary['last_500']) >= 5:
+            champion_summary['percentiles'] = self._calculate_percentiles(champion_summary['last_500'])
+        
         # Periodic re-validation (every 100 champion runs)
-        if len(self.state['champion']['all_runs']) % 100 == 0:
-            log("Periodic champion re-validation...")
-            # Could trigger mini-tournament here
+        if champion_summary['total_count'] % 100 == 0:
+            if not self.quiet:
+                log(f"Periodic check: {champion_summary['total_count']} champion runs completed")
+                if champion_summary['percentiles']:
+                    log(f"  Performance: p50={champion_summary['percentiles']['p50']:.1f}, "
+                        f"p95={champion_summary['percentiles']['p95']:.1f}")
+        
+        # Periodic progress summary (every 50 games)
+        if self.state['total_games'] % 50 == 0:
+            recent_median = np.median(self.state['champion']['recent_performance']) if self.state['champion']['recent_performance'] else float('inf')
+            if not self.quiet:
+                log(f"📊 Progress: Total games={self.state['total_games']}, "
+                    f"Global best={self.state.get('global_best', 'N/A')}, "
+                    f"Recent median={recent_median:.1f}")
         
         self.state_manager.save_state(self.state)
     
@@ -583,12 +935,17 @@ class SmartOptimizer:
         """Check if this is a new best result"""
         current_best = float('inf')
         for eval_data in self.state['evaluations'].values():
-            if eval_data['runs']:
+            if 'run_summary' in eval_data:
+                current_best = min(current_best, eval_data['run_summary']['best_score'])
+            elif 'runs' in eval_data and eval_data['runs']:
                 current_best = min(current_best, min(eval_data['runs']))
         return rejects < current_best
     
     def _display_progress(self):
         """Display current progress and statistics"""
+        if self.quiet:
+            return
+            
         total_games = self.state.get('total_games', 0)
         elapsed = time.time() - self.start_time
         
@@ -604,6 +961,9 @@ class SmartOptimizer:
                 
                 log(f"Grid Search: {completed}/{total_needed} runs ({progress_pct:.1f}%) | "
                     f"ETA: {eta_hours:.1f}h | {games_per_hour:.1f} games/h")
+                    
+                if self.debug:
+                    log(f"  Global best: {self.state.get('global_best', 'N/A')}")
                 
             elif self.state['phase'] == 'validation':
                 log(f"Validation Phase | Total games: {total_games} | {games_per_hour:.1f} games/h")
@@ -612,11 +972,16 @@ class SmartOptimizer:
                 champion = self.state['champion']
                 if champion:
                     recent = champion['recent_performance']
+                    champion_summary = champion.get('run_summary', {})
+                    
                     if recent:
                         recent_median = np.median(recent)
-                        log(f"Improvement: Best={champion['best_single_run']} | "
+                        best_score = champion_summary.get('best_score', 'N/A')
+                        run_count = champion_summary.get('total_count', 0)
+                        
+                        log(f"Improvement: Best={best_score} | "
                             f"Recent median={recent_median:.1f} | "
-                            f"Champion runs={len(champion['all_runs'])} | "
+                            f"Champion runs={run_count} | "
                             f"{games_per_hour:.1f} games/h")
 
 # ========== Main ==========
@@ -624,10 +989,14 @@ def main():
     parser = argparse.ArgumentParser(description="Smart Berghain Optimizer v4.0")
     parser.add_argument("--scenario", type=int, choices=[1, 2, 3],
                        help="Scenario to optimize (required for --target)")
-    parser.add_argument("--workers", type=int, default=4,
+    parser.add_argument("--workers", type=int, default=1,
                        help="Parallel workers for games")
     parser.add_argument("--target", type=int, default=None,
                        help="Target rejection count (requires --scenario)")
+    parser.add_argument("--debug", action="store_true",
+                       help="Show detailed parameter information and debug output")
+    parser.add_argument("--quiet", action="store_true",
+                       help="Suppress all but critical messages")
     
     args = parser.parse_args()
     
@@ -635,13 +1004,17 @@ def main():
     if args.target and not args.scenario:
         parser.error("--target requires --scenario")
     
+    if args.debug and args.quiet:
+        parser.error("--debug and --quiet are mutually exclusive")
+    
     # Default to scenario 1 if not specified
     if not args.scenario:
         args.scenario = 1
-        log("No scenario specified, defaulting to Scenario 1")
+        if not args.quiet:
+            log("No scenario specified, defaulting to Scenario 1")
     
     # Run optimizer
-    optimizer = SmartOptimizer(args.scenario, args.workers, args.target)
+    optimizer = SmartOptimizer(args.scenario, args.workers, args.target, args.debug, args.quiet)
     optimizer.run_forever()
 
 if __name__ == "__main__":
