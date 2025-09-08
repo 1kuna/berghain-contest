@@ -517,13 +517,27 @@ class StateManager:
     def _validate_state(self, state: Dict) -> bool:
         """Validate state structure"""
         required_keys = ['scenario', 'phase', 'K']
+        
+        # Add missing K if not present
+        if 'K' not in state and 'scenario' in state:
+            fallback_K = {1: 2, 2: 2, 3: 3}
+            state['K'] = fallback_K.get(state['scenario'], 2)
+            log(f"Added missing K={state['K']} to state for scenario {state['scenario']}")
+        
         return all(key in state for key in required_keys)
     
     def _create_fresh_state(self) -> Dict:
         """Create fresh state structure"""
-        # Get K from actual game
-        game_data = new_game(self.scenario)
-        K = len(game_data['constraints'])
+        # Get K from actual game with fallback on API failure
+        try:
+            game_data = new_game(self.scenario)
+            K = len(game_data['constraints'])
+        except Exception as e:
+            log(f"API failed during fresh state creation: {e}")
+            # Use fallback K values based on known scenario constraints
+            fallback_K = {1: 2, 2: 2, 3: 3}
+            K = fallback_K.get(self.scenario, 2)
+            log(f"Using fallback K={K} for scenario {self.scenario}")
         
         # Create serializable search space representation (reduced dimensionality)
         search_space = []
@@ -573,7 +587,7 @@ class SmartBOOptimizer:
         # Batch saving optimization
         self.games_since_save = 0
         self.save_interval = 1  # Save after each evaluation
-        self.pending_evaluations = []  # Track unsaved evaluations
+        self.pending_evaluations = []  # Track unsaved evaluations - initialize to empty
         
         # Create persistent pool (optimization)
         if self.workers > 1 and not self.shutdown_requested:
@@ -646,6 +660,45 @@ class SmartBOOptimizer:
             # Try to load existing optimizer state
             self.optimizer = self.state_manager.load_optimizer(self.state)
             
+            # Check for optimizer space mismatch and fix if needed
+            if self.optimizer:
+                expected_space = define_search_space(K)
+                if len(self.optimizer.space) != len(expected_space):
+                    log(f"Optimizer space mismatch detected: loaded={len(self.optimizer.space)}, expected={len(expected_space)}")
+                    log("Recreating optimizer with correct space and warm-starting from existing evaluations")
+                    
+                    # Recreate optimizer with correct space
+                    self.optimizer = Optimizer(
+                        dimensions=expected_space,
+                        base_estimator="ET",
+                        n_initial_points=0,  # Skip initial points since we'll warm-start
+                        acq_func="EI",
+                        random_state=42
+                    )
+                    
+                    # Warm-start with existing bo_evaluations
+                    if self.state.get('bo_evaluations'):
+                        log(f"Warm-starting recreated optimizer with {len(self.state['bo_evaluations'])} existing evaluations")
+                        X = []
+                        y = []
+                        for eval_data in self.state['bo_evaluations']:
+                            point = []
+                            params = eval_data.get('params', {})
+                            # Build point in correct dimension order
+                            for dim in expected_space:
+                                val = params.get(dim.name)
+                                if val is not None:
+                                    point.append(val)
+                                else:
+                                    # Use dimension default if missing
+                                    point.append(dim.low)
+                            if len(point) == len(expected_space):
+                                X.append(point)
+                                y.append(eval_data['median'])
+                        if X:
+                            self.optimizer.tell(X, y)
+                            log(f"Warm-started optimizer with {len(X)} valid evaluations")
+                    
             if not self.optimizer:
                 # Initialize new Optimizer with ET for robustness in high-D
                 self.optimizer = Optimizer(
@@ -676,15 +729,52 @@ class SmartBOOptimizer:
             # Resume partial evaluations if any
             if self.state.get('partial_evals'):
                 log(f"Found {len(self.state['partial_evals'])} partial evaluations to resume")
+                processed_partials = 0
+                
                 for partial in self.state['partial_evals'][:]:  # Copy list to modify during iteration
-                    expected = MIN_RUNS_PER_PARAM  # Expected number of runs
                     current_valid = len(partial.get('runs', []))
-                    missing = expected - current_valid
+                    metadata = partial.get('metadata', {})
                     
                     # Log metadata if available
-                    if 'metadata' in partial:
-                        meta = partial['metadata']
-                        log(f"  Previous attempts: {meta.get('total_attempts', 'unknown')}, Connection errors: {meta.get('connection_errors', 0)}")
+                    if metadata:
+                        log(f"  Previous attempts: {metadata.get('total_attempts', 'unknown')}, Connection errors: {metadata.get('connection_errors', 0)}")
+                    
+                    # Check if this partial can be auto-promoted (>=2 valid runs and not connection_failed)
+                    if (current_valid >= 2 and 
+                        metadata.get('status') != 'connection_failed' and
+                        'params' in partial):
+                        
+                        # Auto-promote to full evaluation without additional runs
+                        rejects = np.array(partial['runs'])
+                        median = np.median(rejects)
+                        variance = np.std(rejects)
+                        
+                        # Add to bo_evaluations
+                        self.state['bo_evaluations'].append({
+                            'params': partial['params'],
+                            'median': float(median),
+                            'runs': partial['runs'],
+                            'variance': float(variance),
+                            'metadata': metadata
+                        })
+                        
+                        # Tell optimizer about the recovered partial
+                        point = []
+                        for dim in self.space:
+                            val = partial['params'].get(dim.name)
+                            if val is not None:
+                                point.append(val)
+                        if len(point) == len(self.space):
+                            self.optimizer.tell([point], [float(median)])
+                        
+                        self.state['partial_evals'].remove(partial)
+                        processed_partials += 1
+                        log(f"Auto-promoted partial eval: median={median:.1f}, variance={variance:.1f}, runs={current_valid}")
+                        continue
+                    
+                    # For partials that need completion
+                    expected = MIN_RUNS_PER_PARAM
+                    missing = expected - current_valid
                     
                     if missing > 0:
                         # Complete the partial evaluation
@@ -725,7 +815,11 @@ class SmartBOOptimizer:
                         if len(point) == len(self.space):
                             self.optimizer.tell([point], [float(median)])
                         self.state['partial_evals'].remove(partial)
+                        processed_partials += 1
                         log(f"Completed partial eval: median={median:.1f}, variance={variance:.1f}")
+                
+                if processed_partials > 0:
+                    log(f"Processed {processed_partials} partials")
                 
                 # Save any remaining partials that couldn't be completed
                 if self.state['partial_evals']:
@@ -812,10 +906,8 @@ class SmartBOOptimizer:
         """Save state with batching"""
         self.games_since_save += 1
         
-        # Save any pending evaluations
-        if self.pending_evaluations:
-            self.state['bo_evaluations'].extend(self.pending_evaluations)
-            self.pending_evaluations = []
+        # Note: pending_evaluations are now immediately added to bo_evaluations
+        # This ensures no data loss on mid-batch crashes
         
         if force or is_best or self.games_since_save >= self.save_interval:
             self.state_manager.save_state(self.state, self.optimizer if SKOPT_AVAILABLE else None)
@@ -893,13 +985,7 @@ class SmartBOOptimizer:
                     pass
             
             try:
-                # Save any pending evaluations before exit
-                if self.pending_evaluations:
-                    self.state['bo_evaluations'].extend(self.pending_evaluations)
-                    if not self.quiet:
-                        print(f"\n[{time.strftime('%H:%M:%S')}] 💾 Saving {len(self.pending_evaluations)} pending evaluations...", flush=True)
-                    self.pending_evaluations = []
-                
+                # Save final state (pending evaluations are now immediately persisted)
                 self._save_state_batch(force=True)
                 if not self.quiet:
                     total_evals = len(self.state.get('bo_evaluations', []))
@@ -984,7 +1070,7 @@ class SmartBOOptimizer:
                 log(f"\n🎮 Evaluation {bo_evals + param_idx}/{min(150, bo_evals + n_points)}: Running {num_runs} games...")
             
             # Track partial results for recovery
-            partial = {'params': params, 'runs': []}
+            partial = {'params': params.copy(), 'runs': []}
             
             try:
                 if not self.quiet and self.workers == 1:
@@ -1000,8 +1086,20 @@ class SmartBOOptimizer:
                         game_results.append(result)
                         log(f"   Game {game_idx}/{num_runs} complete: {result[0]} rejections")
                 else:
-                    # Use centralized game mapping
-                    game_results = self._map_games(args)
+                    # Use centralized game mapping with enhanced error handling
+                    try:
+                        game_results = self._map_games(args)
+                    except Exception as map_error:
+                        log(f"Error in _map_games: {map_error}")
+                        # Clean up pool on error
+                        if self.pool:
+                            try:
+                                self.pool.terminate()
+                                self.pool = None
+                            except:
+                                pass
+                        # Return empty results and let outer exception handler deal with it
+                        game_results = []
                 
                 # Skip if shutdown was requested and we have incomplete results
                 if self.shutdown_requested:
@@ -1023,6 +1121,10 @@ class SmartBOOptimizer:
                 if not valid_results:
                     log(f"   ⚠️ All games failed due to connection errors, skipping evaluation")
                     partial['metadata'] = {'total_attempts': len(all_results), 'connection_errors': len(all_results), 'status': 'connection_failed'}
+                    # Still save partial with connection failure metadata
+                    if partial not in self.state.get('partial_evals', []):
+                        self.state.setdefault('partial_evals', []).append(partial)
+                        self._save_state_batch(force=True)
                     continue
                 
                 rejects = np.array(valid_results)
@@ -1050,7 +1152,12 @@ class SmartBOOptimizer:
                             extra_results.append(result)
                             log(f"   Extra game {extra_idx}/3 complete: {result[0]} rejections")
                     else:
-                        extra_results = self._map_games(extra_args)
+                        # Enhanced error handling for variance resampling
+                        try:
+                            extra_results = self._map_games(extra_args)
+                        except Exception as extra_map_error:
+                            log(f"Error in variance resampling _map_games: {extra_map_error}")
+                            extra_results = []
                     
                     if extra_results:  # Only append if we got results
                         # Filter out connection errors from extra results
@@ -1069,14 +1176,15 @@ class SmartBOOptimizer:
                 
                 results.append(median_score)
                 
-                # Store evaluation (as pending until saved)
+                # Store evaluation and immediately persist to prevent data loss
                 new_eval = {
                     'params': params,
                     'median': median_score,
                     'runs': partial['runs'],
                     'variance': variance
                 }
-                self.pending_evaluations.append(new_eval)
+                # Immediately add to state to prevent loss on mid-batch crash
+                self.state['bo_evaluations'].append(new_eval)
                 
                 self.state['total_games'] += len(partial['runs'])
                 
@@ -1087,6 +1195,14 @@ class SmartBOOptimizer:
             except Exception as e:
                 log(f"Evaluation interrupted: {e}")
                 median_score = float('inf')  # Default value for failed evaluation
+                # Clean up pool on evaluation error
+                if self.pool:
+                    try:
+                        self.pool.terminate()
+                        self.pool = None
+                        log("Pool terminated due to evaluation error")
+                    except:
+                        pass
                 # Save partial immediately on exception
                 if partial['runs']:
                     self.state.setdefault('partial_evals', []).append(partial)
@@ -1110,12 +1226,17 @@ class SmartBOOptimizer:
                 self._save_state_batch()
         
         if not self.shutdown_requested and results:
-            # Tell optimizer about all results from this batch
-            used_points = next_points[:len(results)]
-            self.optimizer.tell(used_points, results)
-            self._save_state_batch(force=True)
-            if not self.quiet:
-                log(f"\n📈 BO iteration complete. Total evaluations: {len(self.state.get('bo_evaluations', []))}/150")
+            # Tell optimizer about all results from this batch with error handling
+            try:
+                used_points = next_points[:len(results)]
+                self.optimizer.tell(used_points, results)
+                self._save_state_batch(force=True)
+                if not self.quiet:
+                    log(f"\n📈 BO iteration complete. Total evaluations: {len(self.state.get('bo_evaluations', []))}/150")
+            except Exception as tell_error:
+                log(f"Error in optimizer.tell(): {tell_error}")
+                # Save state anyway to preserve evaluations
+                self._save_state_batch(force=True)
     
     def _run_validation(self):
         """Phase 2: Select champion through validation"""
@@ -1135,7 +1256,8 @@ class SmartBOOptimizer:
         if not self.quiet:
             log(f"Validating top {len(top_candidates)} candidates with extended runs...")
         
-        # Run 15 additional evaluations for each top candidate (reduced from 20)
+        # Initialize validation progress tracking
+        self.state.setdefault('validation_progress', {})
         validation_results = []
         
         for candidate in top_candidates:
@@ -1143,31 +1265,62 @@ class SmartBOOptimizer:
                 break
             
             params = candidate['params']
-            args = [(self.scenario, params) for _ in range(15)]
             
-            results = self._map_games(args)
+            # Create candidate hash for tracking
+            candidate_hash = hash(tuple(sorted(params.items())))
             
-            # Filter out connection errors
-            all_results = [r[0] for r in results]
-            rejects = [r for r in all_results if r != CONNECTION_ERROR]
+            # Check if we have progress for this candidate
+            progress = self.state['validation_progress'].get(str(candidate_hash), {'partial_runs': [], 'target': 15})
+            existing_runs = len(progress['partial_runs'])
+            remaining_runs = 15 - existing_runs
             
-            # Skip if too many connection errors
-            if len(rejects) < 5:  # Need at least 5 valid results for validation
-                log(f"   ⚠️ Too many connection errors ({len(all_results) - len(rejects)}/{len(all_results)}), skipping candidate")
-                continue
+            if not self.quiet and existing_runs > 0:
+                log(f"Resuming validation: {existing_runs} runs already completed, {remaining_runs} remaining")
+            
+            # Only run remaining games
+            if remaining_runs > 0:
+                args = [(self.scenario, params) for _ in range(remaining_runs)]
+                results = self._map_games(args)
                 
-            stats = calculate_statistics(rejects, detailed=True)
+                # Filter out connection errors and add to progress
+                all_results = [r[0] for r in results]
+                valid_results = [r for r in all_results if r != CONNECTION_ERROR]
+                
+                if valid_results:
+                    progress['partial_runs'].extend(valid_results)
+                    # Update total_games with only valid results
+                    self.state['total_games'] += len(valid_results)
+                
+                # Save progress to state
+                self.state['validation_progress'][str(candidate_hash)] = progress
+                self._save_state_batch()
             
-            validation_results.append({
-                'params': params,
-                'stats': stats,
-                'runs': rejects
-            })
-            
-            self.state['total_games'] += 15
-            
-            if not self.quiet:
-                log(f"Validation: median={stats['median']:.1f}, CI=[{stats['confidence_95'][0]:.1f}, {stats['confidence_95'][1]:.1f}]")
+            # Check if we have enough runs to evaluate this candidate
+            if len(progress['partial_runs']) >= 15 or self.shutdown_requested:
+                # Use all available runs for statistics
+                final_runs = progress['partial_runs']
+                
+                # Skip if too few valid results
+                if len(final_runs) < 5:
+                    log(f"   ⚠️ Too few valid results ({len(final_runs)}), skipping candidate")
+                    continue
+                
+                stats = calculate_statistics(final_runs, detailed=True)
+                
+                validation_results.append({
+                    'params': params,
+                    'stats': stats,
+                    'runs': final_runs
+                })
+                
+                if not self.quiet:
+                    log(f"Validation complete: median={stats['median']:.1f}, CI=[{stats['confidence_95'][0]:.1f}, {stats['confidence_95'][1]:.1f}], runs={len(final_runs)}")
+            else:
+                # Partial completion - will be resumed on next run
+                runs_completed = len(progress['partial_runs'])
+                if not self.quiet:
+                    log(f"Partial validation: {runs_completed}/{15} runs completed")
+                return  # Exit validation to resume later
         
         if validation_results and not self.shutdown_requested:
             # Select best based on median
@@ -1195,6 +1348,10 @@ class SmartBOOptimizer:
             log(f"🏆 CHAMPION SELECTED: median={best_result['stats']['median']:.1f}, best={min(best_result['runs'])}")
             if not self.quiet or self.debug:
                 log(f"  Params: {json.dumps(best_result['params'], indent=2)}")
+            
+            # Clean up validation progress on successful completion
+            if 'validation_progress' in self.state:
+                del self.state['validation_progress']
             
             self.state['phase'] = 'improvement'
             self._save_state_batch(force=True)
