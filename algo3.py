@@ -180,24 +180,46 @@ def decide(
     if sum_missing >= 1.0 - EPS:
         return False
     
-    # Compute weights dynamically from meta-parameters
-    base_weights = np.ones(K)
-    weights = base_weights * params.get('weight_scale', 1.0)
+    # Compute weights dynamically from meta-parameters using inverse prior + dynamic risk
     
-    if 'weight_var' in params and K > 2:
-        # Apply variance based on minCount ratios (precomputed)
-        mins = np.array([c['minCount'] for c in constraints])
-        max_min = np.max(mins)
-        if max_min > 0:
-            # Higher minCount gets more weight adjustment
-            weight_adjustments = (mins / max_min) * params['weight_var']
-            weights = weights * (1.0 + weight_adjustments)
+    # Marginals (hardcoded per scenario or EMA; tuned for S3)
+    p_marg = np.array([0.65, 0.45, 0.3, 0.75]) if K == 4 else np.full(K, 0.5)  # Fallback for other scenarios
+    exp_left = np.maximum(1.0, p_marg * max(S, 1))
     
-    weighted_pressure = np.sum((needs[missing_mask] / max(S, EPS)) * weights[missing_mask])
+    # Inverse prior (smooth exp, clipped)
+    total_min = sum(c['minCount'] for c in constraints)
+    inv_base = np.array([total_min / (K * c['minCount']) for c in constraints])
+    inv_prior = np.clip(np.exp(params.get('weight_var', 1.0) * np.log(inv_base)), 0.5, 3.0)
+    weights = np.ones(K) * inv_prior
+    
+    # Dynamic risk (need/exp_left ^ beta)
+    risk = needs / exp_left
+    beta = params.get('risk_beta', 1.0) * params['weight_var'] if 'weight_var' in params else params.get('risk_beta', 1.0)  # 0.5-1.5 range
+    weights *= np.clip(np.power(risk, beta), 0.4, 2.5)
+    
+    # Apply base scale
+    weights *= params.get('weight_scale', 1.0)
+    
+    # Overshoot penalty and scarce guard
+    accepted_arr = np.array([accepted_count.get(c['attribute'], 0) for c in constraints])
+    minC_arr = np.array([c['minCount'] for c in constraints])
+    proj_surplus = np.maximum(0, (accepted_arr + exp_left) - minC_arr) / max(S, 1)
+    alpha = params.get('overshoot_alpha', 0.8)
+    weights *= 1.0 / (1.0 + alpha * proj_surplus)  # Downweight safe attributes
+    
+    # Scarce guard (top-2 risk; tax if oversupplied + no cover)
+    weighted_pressure = 0  # Initialize weighted_pressure
+    if np.sum(needs > 0) > 0:
+        scarcity_idx = np.argsort(-risk)[:min(2, K)]
+        oversupplied = proj_surplus > params.get('overshoot_eps', 0.02)
+        has_oversupplied = np.any(person_attrs & oversupplied)
+        covers_scarce = np.any(person_attrs[scarcity_idx])
+        if has_oversupplied and not covers_scarce:
+            weighted_pressure += params.get('overshoot_tax', 0.05)  # Tax for oversupplied without scarce coverage
+    
+    weighted_pressure += np.sum((needs[missing_mask] / max(S, EPS)) * weights[missing_mask])
     
     # Adjustments
-    threshold = params['threshold']
-    
     # Early game bonus
     early_bonus = params.get('early_bonus', 0.0) if S >= params.get('early_threshold', 800) else 0.0
     
@@ -215,7 +237,16 @@ def decide(
     
     adjusted_pressure = weighted_pressure - early_bonus - ab_bonus
     
-    return adjusted_pressure < threshold
+    # Threshold ramp: stricter late in the game
+    base_t = params['threshold']
+    ramp = params.get('threshold_ramp', 0.08)
+    t = base_t + ramp * (1 - S / N)
+    
+    # Debug logging (controlled by debug parameter)
+    if params.get('debug', False):
+        print(f"Debug: S={S}, weights={weights.round(3)}, risk={risk.round(3)}, proj_surplus={proj_surplus.round(4)}, adjusted_pressure={adjusted_pressure:.3f}, threshold={t:.3f}")
+    
+    return adjusted_pressure < t
 
 # ========== Game Runner ==========
 def run_game(args: Tuple[int, Dict]) -> Tuple[int, Dict]:
@@ -291,7 +322,12 @@ def define_search_space(K: int) -> List:
         Real(0.0, 0.1, name='early_bonus'),
         Real(0.0, 0.2, name='ab_bonus'),
         Integer(600, 900, name='early_threshold'),
-        Real(0.5, 2.0, name='weight_scale')  # Uniform scale for all weights
+        Real(0.5, 2.0, name='weight_scale'),  # Uniform scale for all weights
+        Real(0.5, 1.5, name='risk_beta'),  # Dynamic risk exponent
+        Real(0.5, 1.0, name='overshoot_alpha'),  # Overshoot penalty factor
+        Real(0.0, 0.1, name='threshold_ramp'),  # Threshold ramp factor
+        Real(0.0, 0.08, name='overshoot_tax'),  # Tax for oversupplied without scarce
+        Real(0.01, 0.05, name='overshoot_eps')  # Threshold for considering oversupplied
     ]
     if K > 2:
         space.append(Real(0.0, 1.0, name='weight_var'))  # Variance factor for differential weighting
@@ -340,7 +376,7 @@ def fallback_random_search(scenario: int, K: int, workers: int, n_calls: int = 2
     try:
         from scipy.stats import qmc
         # Use Latin Hypercube for better coverage
-        d = 5 + (1 if K > 2 else 0)  # Number of dimensions
+        d = 10 + (1 if K > 2 else 0)  # Number of dimensions (5 original + 5 new parameters)
         sampler = qmc.LatinHypercube(d=d)
         U = sampler.random(n_calls)  # Generate [0,1) samples
         
@@ -366,10 +402,15 @@ def fallback_random_search(scenario: int, K: int, workers: int, n_calls: int = 2
                 'early_bonus': scale(u[1], 0.0, 0.1),
                 'ab_bonus': scale(u[2], 0.0, 0.2),
                 'early_threshold': scale(u[3], 600, 900, integer=True),
-                'weight_scale': scale(u[4], 0.5, 2.0)
+                'weight_scale': scale(u[4], 0.5, 2.0),
+                'risk_beta': scale(u[5], 0.5, 1.5),
+                'overshoot_alpha': scale(u[6], 0.5, 1.0),
+                'threshold_ramp': scale(u[7], 0.0, 0.1),
+                'overshoot_tax': scale(u[8], 0.0, 0.08),
+                'overshoot_eps': scale(u[9], 0.01, 0.05)
             }
             if K > 2:
-                params['weight_var'] = scale(u[5], 0.0, 1.0)
+                params['weight_var'] = scale(u[10], 0.0, 1.0)
         else:
             # Fallback to standard random sampling
             params = {
@@ -377,7 +418,12 @@ def fallback_random_search(scenario: int, K: int, workers: int, n_calls: int = 2
                 'early_bonus': np.random.uniform(0.0, 0.1),
                 'ab_bonus': np.random.uniform(0.0, 0.2),
                 'early_threshold': np.random.randint(600, 901),
-                'weight_scale': np.random.uniform(0.5, 2.0)
+                'weight_scale': np.random.uniform(0.5, 2.0),
+                'risk_beta': np.random.uniform(0.5, 1.5),
+                'overshoot_alpha': np.random.uniform(0.5, 1.0),
+                'threshold_ramp': np.random.uniform(0.0, 0.1),
+                'overshoot_tax': np.random.uniform(0.0, 0.08),
+                'overshoot_eps': np.random.uniform(0.01, 0.05)
             }
             if K > 2:
                 params['weight_var'] = np.random.uniform(0.0, 1.0)
@@ -539,13 +585,18 @@ class StateManager:
             K = fallback_K.get(self.scenario, 2)
             log(f"Using fallback K={K} for scenario {self.scenario}")
         
-        # Create serializable search space representation (reduced dimensionality)
+        # Create serializable search space representation (expanded dimensionality)
         search_space = []
         search_space.append({'type': 'Real', 'low': 0.60, 'high': 1.00, 'name': 'threshold'})
         search_space.append({'type': 'Real', 'low': 0.0, 'high': 0.1, 'name': 'early_bonus'})
         search_space.append({'type': 'Real', 'low': 0.0, 'high': 0.2, 'name': 'ab_bonus'})
         search_space.append({'type': 'Integer', 'low': 600, 'high': 900, 'name': 'early_threshold'})
         search_space.append({'type': 'Real', 'low': 0.5, 'high': 2.0, 'name': 'weight_scale'})
+        search_space.append({'type': 'Real', 'low': 0.5, 'high': 1.5, 'name': 'risk_beta'})
+        search_space.append({'type': 'Real', 'low': 0.5, 'high': 1.0, 'name': 'overshoot_alpha'})
+        search_space.append({'type': 'Real', 'low': 0.0, 'high': 0.1, 'name': 'threshold_ramp'})
+        search_space.append({'type': 'Real', 'low': 0.0, 'high': 0.08, 'name': 'overshoot_tax'})
+        search_space.append({'type': 'Real', 'low': 0.01, 'high': 0.05, 'name': 'overshoot_eps'})
         
         if K > 2:
             search_space.append({'type': 'Real', 'low': 0.0, 'high': 1.0, 'name': 'weight_var'})
@@ -1054,6 +1105,9 @@ class SmartBOOptimizer:
                     params[dim.name] = int(point[i])
                 else:
                     params[dim.name] = point[i]
+            # Add debug flag if optimizer is in debug mode
+            if self.debug:
+                params['debug'] = True
             param_dicts.append(params)
         
         # Evaluate points in parallel
@@ -1432,6 +1486,10 @@ class SmartBOOptimizer:
                         log(f"🚀 Champion improved through re-optimization: median={median_score:.1f}")
         
         # Run regular champion games
+        # Add debug flag if optimizer is in debug mode
+        if self.debug:
+            champion_params = champion_params.copy()
+            champion_params['debug'] = True
         args = [(self.scenario, champion_params) for _ in range(self.workers)]
         
         results = self._map_games(args)
