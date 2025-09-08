@@ -59,7 +59,7 @@ def new_game(scenario: int, attempt: int = 0) -> Dict:
         try:
             resp = sess.get(url, params=params, timeout=10)
             if resp.status_code == 429:  # Rate limited
-                wait = min(300, 10 * (2 ** attempt))
+                wait = min(300, 10 * (2 ** attempt) * (0.8 + 0.4 * random.random()))
                 log(f"Rate limited, waiting {wait}s...")
                 time.sleep(wait)
                 return new_game(scenario, attempt + 1)
@@ -82,7 +82,7 @@ def decide_and_next(game_id: str, person_index: int, accept: Optional[bool] = No
         try:
             resp = sess.get(url, params=params, timeout=10)
             if resp.status_code == 429:
-                wait = min(300, 10 * (2 ** attempt))
+                wait = min(300, 10 * (2 ** attempt) * (0.8 + 0.4 * random.random()))
                 log(f"Rate limited, waiting {wait}s...")
                 time.sleep(wait)
                 return decide_and_next(game_id, person_index, accept, attempt + 1)
@@ -345,9 +345,16 @@ class StateManager:
     
     def _create_fresh_state(self) -> Dict:
         """Create fresh state structure"""
-        # Get K from actual game
-        game_data = new_game(self.scenario)
-        K = len(game_data['constraints'])
+        # Get K from actual game with fallback on API failure
+        try:
+            game_data = new_game(self.scenario)
+            K = len(game_data['constraints'])
+        except Exception as e:
+            log(f"API failed during fresh state creation: {e}")
+            # Use fallback K values based on known scenario constraints
+            fallback_K = {1: 2, 2: 4, 3: 6}
+            K = fallback_K.get(self.scenario, 2)
+            log(f"Using fallback K={K} for scenario {self.scenario}")
         
         # Generate grid
         grid_params = generate_grid_params(K)

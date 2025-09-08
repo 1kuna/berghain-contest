@@ -84,7 +84,7 @@ def new_game(scenario: int, attempt: int = 0) -> Dict:
         try:
             resp = sess.get(url, params=params, timeout=10, verify=False)
             if resp.status_code == 429:  # Rate limited
-                wait = min(300, 10 * (2 ** attempt))
+                wait = min(300, 10 * (2 ** attempt) * (0.8 + 0.4 * random.random()))
                 log(f"Rate limited, waiting {wait}s...")
                 time.sleep(wait)
                 return new_game(scenario, attempt + 1)
@@ -120,7 +120,7 @@ def decide_and_next(game_id: str, person_index: int, accept: Optional[bool] = No
         try:
             resp = sess.get(url, params=params, timeout=10, verify=False)
             if resp.status_code == 429:
-                wait = min(300, 10 * (2 ** attempt))
+                wait = min(300, 10 * (2 ** attempt) * (0.8 + 0.4 * random.random()))
                 log(f"Rate limited, waiting {wait}s...")
                 time.sleep(wait)
                 return decide_and_next(game_id, person_index, accept, attempt + 1)
@@ -296,6 +296,11 @@ def run_game(args: Tuple[int, Dict]) -> Tuple[int, Dict]:
         admitted = 0
         rejected = 0
         
+        # Initialize EMA observation counts for all-seen people tracking
+        K = len(constraints)
+        obs_counts = np.array(params.get('obs_counts', [0.0] * K))
+        obs_total = params.get('obs_total', 0)
+        
         # Get first person
         resp = decide_and_next(game_id, 0)
         
@@ -304,6 +309,13 @@ def run_game(args: Tuple[int, Dict]) -> Tuple[int, Dict]:
             person = resp.get('nextPerson')
             if not person:
                 break
+            
+            # Count every person encountered (pre-decision for all-seen EMA)
+            if person:
+                for i, c in enumerate(constraints):
+                    if person['attributes'].get(c['attribute'], False):
+                        obs_counts[i] += 1
+                obs_total += 1  # Count every person encountered
             
             # Make decision
             accept = decide(constraints, admitted, person, accepted_count, params)
@@ -325,16 +337,7 @@ def run_game(args: Tuple[int, Dict]) -> Tuple[int, Dict]:
             if admitted >= N or rejected >= MAX_REJECTS:
                 break
         
-        # Update EMA observation counts for multi-scenario optimization
-        K = len(constraints)
-        obs_counts = np.array(params.get('obs_counts', [0.0] * K))
-        obs_total = params.get('obs_total', 0)
-        
-        # Add accepted counts to observations (proportional to admitted)
-        for i, c in enumerate(constraints):
-            attr = c['attribute']
-            obs_counts[i] += accepted_count.get(attr, 0)
-        obs_total += admitted
+        # EMA observation counts now updated during main loop with all-seen people
         
         # Update params with new observations
         updated_params = params.copy()
@@ -382,7 +385,7 @@ def create_objective_function(scenario: int, optimizer_instance):
     def objective(**params: Dict) -> float:
         # Add scenario and obs state to params for multi-scenario optimization
         params['scenario'] = scenario
-        params['obs_counts'] = optimizer_instance.state.get('obs_counts', [0.0] * len(optimizer_instance.state.get('search_space', [])))
+        params['obs_counts'] = optimizer_instance.state.get('obs_counts', [0.0] * optimizer_instance.state['K'])
         params['obs_total'] = optimizer_instance.state.get('obs_total', 0)
         if optimizer_instance.debug:
             params['debug'] = True
@@ -648,7 +651,7 @@ class StateManager:
         
         # Add missing K if not present
         if 'K' not in state and 'scenario' in state:
-            fallback_K = {1: 2, 2: 2, 3: 3}
+            fallback_K = {1: 2, 2: 4, 3: 6}
             state['K'] = fallback_K.get(state['scenario'], 2)
             log(f"Added missing K={state['K']} to state for scenario {state['scenario']}")
         
@@ -663,7 +666,7 @@ class StateManager:
         except Exception as e:
             log(f"API failed during fresh state creation: {e}")
             # Use fallback K values based on known scenario constraints
-            fallback_K = {1: 2, 2: 2, 3: 3}
+            fallback_K = {1: 2, 2: 4, 3: 6}
             K = fallback_K.get(self.scenario, 2)
             log(f"Using fallback K={K} for scenario {self.scenario}")
         
@@ -703,7 +706,7 @@ class StateManager:
 
 # ========== Smart Optimizer with BO ==========
 class SmartBOOptimizer:
-    def __init__(self, scenario: int, workers: int = 4, target: Optional[int] = None, debug: bool = False, quiet: bool = False):
+    def __init__(self, scenario: int, workers: int = 1, target: Optional[int] = None, debug: bool = False, quiet: bool = False):
         self.scenario = scenario
         self.workers = workers
         self.target = target
@@ -1057,7 +1060,7 @@ class SmartBOOptimizer:
         """Determine current phase from state"""
         bo_evals = len(self.state.get('bo_evaluations', []))
         
-        if bo_evals < 200:  # Extended BO search phase
+        if bo_evals < 250:  # Extended BO search phase
             self.state['phase'] = 'bo_search'
         elif not self.state.get('champion'):
             self.state['phase'] = 'validation'
@@ -1141,7 +1144,7 @@ class SmartBOOptimizer:
             # Fallback to random search
             if len(self.state.get('bo_evaluations', [])) == 0:
                 best_params, best_score = fallback_random_search(
-                    self.scenario, self.state['K'], self.workers, n_calls=200
+                    self.scenario, self.state['K'], 1, n_calls=200
                 )
                 self.state['bo_evaluations'].append({
                     'params': best_params,
@@ -1155,28 +1158,28 @@ class SmartBOOptimizer:
         
         # Check budget
         bo_evals = len(self.state.get('bo_evaluations', []))
-        if bo_evals >= 200:  # Extended budget for better convergence
+        if bo_evals >= 250:  # Extended budget for better convergence
             log("BO search budget exhausted, moving to validation")
             self.state['phase'] = 'validation'
             self._save_state_batch(force=True)
             return
         
-        # Check for no improvement (after 50 evals)
-        if bo_evals > 50:
-            recent_best = min([e['median'] for e in self.state['bo_evaluations'][-15:]])
+        # Check for no improvement (after 75 evals)
+        if bo_evals > 75:
+            recent_best = min([e['median'] for e in self.state['bo_evaluations'][-20:]])
             overall_best = self.state.get('global_best', float('inf'))
-            if recent_best > overall_best * 0.95:  # No-improvement threshold
-                log("No significant improvement in last 15 iterations, moving to validation")
+            if recent_best > overall_best * 0.97:  # No-improvement threshold
+                log("No significant improvement in last 20 iterations, moving to validation")
                 self.state['phase'] = 'validation'
                 self._save_state_batch(force=True)
                 return
         
         # Determine how many new points to evaluate (aggressive batching)
-        n_points = min(self.workers * 3, 200 - bo_evals)  # More aggressive batching
+        n_points = min(self.workers * 3, 250 - bo_evals)  # More aggressive batching
         
         if not self.quiet:
             current_best = self.state.get('global_best', 'N/A')
-            log(f"\n📊 BO Search Progress: {bo_evals}/200 evaluations completed")
+            log(f"\n📊 BO Search Progress: {bo_evals}/250 evaluations completed")
             log(f"   Current best: {current_best} rejections")
             log(f"   Requesting {n_points} new points to evaluate...")
         
@@ -1195,6 +1198,11 @@ class SmartBOOptimizer:
             # Add debug flag if optimizer is in debug mode
             if self.debug:
                 params['debug'] = True
+            
+            # Carry current state to this param's games
+            params['obs_counts'] = self.state['obs_counts'].copy() if 'obs_counts' in self.state else [0.0] * self.state['K']
+            params['obs_total'] = self.state.get('obs_total', 0)
+            
             param_dicts.append(params)
         
         # Evaluate points in parallel
@@ -1208,7 +1216,7 @@ class SmartBOOptimizer:
             args = [(self.scenario, params) for _ in range(num_runs)]
             
             if not self.quiet:
-                log(f"\n🎮 Evaluation {bo_evals + param_idx}/{min(150, bo_evals + n_points)}: Running {num_runs} games...")
+                log(f"\n🎮 Evaluation {bo_evals + param_idx}/{min(250, bo_evals + n_points)}: Running {num_runs} games...")
             
             # Track partial results for recovery
             partial = {'params': params.copy(), 'runs': []}
@@ -1311,6 +1319,28 @@ class SmartBOOptimizer:
                             partial['metadata']['total_attempts'] += len(all_extra)
                             partial['metadata']['connection_errors'] += all_extra.count(CONNECTION_ERROR)
                 
+                # Gather all valid params from base + extra games
+                base_valid_params = [r[1] for r in game_results if r[0] != CONNECTION_ERROR]
+                extra_valid_params = []  # Init empty
+                if 'extra_results' in locals() and extra_results:
+                    extra_valid_params = [r[1] for r in extra_results if r[0] != CONNECTION_ERROR]
+                all_valid_params = base_valid_params + extra_valid_params
+                
+                # Compute deltas: sum (final - initial) across valid games
+                initial_counts = np.array(params['obs_counts'])
+                initial_total = params['obs_total']
+                delta_counts = np.zeros(self.state['K'])
+                delta_total = 0
+                for p in all_valid_params:
+                    final_c = np.array(p['obs_counts'])
+                    final_t = p['obs_total']
+                    delta_counts += (final_c - initial_counts)
+                    delta_total += (final_t - initial_total)
+                
+                # Accumulate to global state
+                self.state['obs_counts'] = (np.array(self.state['obs_counts']) + delta_counts).tolist()
+                self.state['obs_total'] += delta_total
+                
                 # Initialize median_score with proper scope
                 median_score = float(np.median(rejects))
                 variance = float(np.std(rejects))
@@ -1373,7 +1403,7 @@ class SmartBOOptimizer:
                 self.optimizer.tell(used_points, results)
                 self._save_state_batch(force=True)
                 if not self.quiet:
-                    log(f"\n📈 BO iteration complete. Total evaluations: {len(self.state.get('bo_evaluations', []))}/150")
+                    log(f"\n📈 BO iteration complete. Total evaluations: {len(self.state.get('bo_evaluations', []))}/250")
             except Exception as tell_error:
                 log(f"Error in optimizer.tell(): {tell_error}")
                 # Save state anyway to preserve evaluations
@@ -1406,6 +1436,9 @@ class SmartBOOptimizer:
                 break
             
             params = candidate['params']
+            params = params.copy()
+            params['obs_counts'] = self.state['obs_counts'].copy() if 'obs_counts' in self.state else [0.0] * self.state['K']
+            params['obs_total'] = self.state.get('obs_total', 0)
             
             # Create candidate hash for tracking
             candidate_hash = hash(tuple(sorted(params.items())))
@@ -1420,21 +1453,29 @@ class SmartBOOptimizer:
             
             # Only run remaining games
             if remaining_runs > 0:
-                args = [(self.scenario, params) for _ in range(remaining_runs)]
-                results = self._map_games(args)
-                
-                # Filter out connection errors and add to progress
-                all_results = [r[0] for r in results]
-                valid_results = [r for r in all_results if r != CONNECTION_ERROR]
-                
-                if valid_results:
-                    progress['partial_runs'].extend(valid_results)
-                    # Update total_games with only valid results
-                    self.state['total_games'] += len(valid_results)
-                
-                # Save progress to state
-                self.state['validation_progress'][str(candidate_hash)] = progress
-                self._save_state_batch()
+                current_obs_counts = params['obs_counts'].copy()
+                current_obs_total = params['obs_total']
+                valid_results_this_candidate = []  # Track for stats
+                for _ in range(remaining_runs):
+                    if self.shutdown_requested:
+                        break
+                    run_params = params.copy()
+                    run_params['obs_counts'] = current_obs_counts.copy()
+                    run_params['obs_total'] = current_obs_total
+                    result = run_game((self.scenario, run_params))
+                    if result[0] != CONNECTION_ERROR:
+                        valid_results_this_candidate.append(result[0])
+                        progress['partial_runs'].extend([result[0]])  # Append single
+                        # Carry forward and accumulate to global
+                        current_obs_counts = np.array(result[1]['obs_counts']).copy()
+                        current_obs_total = result[1]['obs_total']
+                        self.state['obs_counts'] = current_obs_counts.tolist()
+                        self.state['obs_total'] = current_obs_total
+                        self.state['total_games'] += 1
+                    # Save after each game
+                    self.state['validation_progress'][str(candidate_hash)] = progress
+                    self._save_state_batch()
+                # For stats: Use progress['partial_runs'] (cumulative)
             
             # Check if we have enough runs to evaluate this candidate
             if len(progress['partial_runs']) >= 20 or self.shutdown_requested:
@@ -1549,6 +1590,8 @@ class SmartBOOptimizer:
                     for i, dim in enumerate(narrowed_space):
                         v = next_point[i]
                         params[dim.name] = int(v) if dim.name == 'early_threshold' else v
+                    params['obs_counts'] = self.state['obs_counts'].copy()
+                    params['obs_total'] = self.state['obs_total']
                     
                     # Evaluate with reduced runs for speed
                     args = [(self.scenario, params) for _ in range(3)]
@@ -1561,6 +1604,20 @@ class SmartBOOptimizer:
                         
                         if len(rejects) >= 2:  # Need at least 2 valid results
                             median_score = np.median(rejects)
+                            # Accumulate delta as in BO (sum (final-initial) from valid_params)
+                            valid_params = [r[1] for r in results if r[0] != CONNECTION_ERROR]
+                            initial_counts = np.array(params['obs_counts'])
+                            initial_total = params['obs_total']
+                            delta_counts = np.zeros(self.state['K'])
+                            delta_total = 0
+                            for p in valid_params:
+                                final_c = np.array(p['obs_counts'])
+                                final_t = p['obs_total']
+                                delta_counts += (final_c - initial_counts)
+                                delta_total += (final_t - initial_total)
+                            # Accumulate to global state
+                            self.state['obs_counts'] = (np.array(self.state['obs_counts']) + delta_counts).tolist()
+                            self.state['obs_total'] += delta_total
                             # Tell local optimizer about result
                             local_optimizer.tell([next_point], [median_score])
                         else:
@@ -1573,31 +1630,31 @@ class SmartBOOptimizer:
                         log(f"🚀 Champion improved through re-optimization: median={median_score:.1f}")
         
         # Run regular champion games
-        # Add debug flag if optimizer is in debug mode
+        champion_params = champion_params.copy()
+        champion_params['obs_counts'] = self.state['obs_counts'].copy() if 'obs_counts' in self.state else [0.0] * self.state['K']
+        champion_params['obs_total'] = self.state.get('obs_total', 0)
         if self.debug:
-            champion_params = champion_params.copy()
             champion_params['debug'] = True
-        args = [(self.scenario, champion_params) for _ in range(self.workers)]
+        args = [(self.scenario, champion_params)]  # Single for sequential
         
-        results = self._map_games(args)
+        results = [run_game(args[0])]
         
         # Update champion stats
-        for rejects, _ in results:
-            # Update bounded history
+        rejects, updated_params = results[0]
+        if rejects != CONNECTION_ERROR:
+            # Accumulate to state
+            self.state['obs_counts'] = updated_params['obs_counts'].copy()
+            self.state['obs_total'] = updated_params['obs_total']
+            self.state['total_games'] += 1
+            # Proceed with updates
             champion_summary['last_500'].append(rejects)
             if len(champion_summary['last_500']) > 500:
                 champion_summary['last_500'].pop(0)
-            
             champion_summary['total_count'] += 1
-            
-            # Update recent performance
             self.state['champion']['recent_performance'].append(rejects)
             if len(self.state['champion']['recent_performance']) > 20:
                 self.state['champion']['recent_performance'].pop(0)
-            
-            self.state['total_games'] += 1
-            
-            # Check for improvement
+            # Check for improvement...
             if rejects < champion_summary['best_score']:
                 champion_summary['best_score'] = rejects
                 total_runs = champion_summary['total_count']
@@ -1611,6 +1668,9 @@ class SmartBOOptimizer:
                 if self.target and rejects <= self.target:
                     log(f"🎯 TARGET {self.target} ACHIEVED WITH {rejects}!")
                     self._save_state_batch(force=True)
+        else:
+            # Skip on connection error
+            pass
         
         # Update percentiles
         if len(champion_summary['last_500']) >= 5:
@@ -1647,9 +1707,9 @@ class SmartBOOptimizer:
                 bo_evals = len(self.state.get('bo_evaluations', []))
                 pending = len(self.pending_evaluations)
                 best_median = min([e['median'] for e in self.state['bo_evaluations']]) if self.state.get('bo_evaluations') else 'N/A'
-                eta_hours = (150 - bo_evals) / (games_per_hour / 3) if games_per_hour > 0 else 0  # 3 games per eval
+                eta_hours = (250 - bo_evals) / (games_per_hour / 3) if games_per_hour > 0 else 0  # 3 games per eval
                 
-                log(f"BO Search: {bo_evals}/150 evaluations (+{pending} pending) | "
+                log(f"BO Search: {bo_evals}/250 evaluations (+{pending} pending) | "
                     f"Best: {best_median} | "
                     f"ETA: {eta_hours:.1f}h | "
                     f"{games_per_hour:.1f} games/h")
@@ -1679,7 +1739,7 @@ def main():
     parser.add_argument("--scenario", type=int, choices=[1, 2, 3],
                        help="Scenario to optimize (required for --target)")
     parser.add_argument("--workers", type=int, default=1,
-                       help="Parallel workers for games")
+                       help="Parallel workers for games (max 1 to avoid rate limits)")
     parser.add_argument("--target", type=int, default=None,
                        help="Target rejection count (requires --scenario)")
     parser.add_argument("--debug", action="store_true",
@@ -1688,6 +1748,9 @@ def main():
                        help="Suppress all but critical messages")
     
     args = parser.parse_args()
+    
+    # Enforce workers=1 cap to avoid rate limits
+    args.workers = min(args.workers, 1)
     
     # Validate arguments
     if args.target and not args.scenario:

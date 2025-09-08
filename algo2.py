@@ -86,7 +86,7 @@ def new_game(scenario: int, attempt: int = 0) -> Dict:
         try:
             resp = sess.get(url, params=params, timeout=10, verify=False)
             if resp.status_code == 429:  # Rate limited
-                wait = min(300, 10 * (2 ** attempt))
+                wait = min(300, 10 * (2 ** attempt) * (0.8 + 0.4 * random.random()))
                 log(f"Rate limited, waiting {wait}s...")
                 time.sleep(wait)
                 return new_game(scenario, attempt + 1)
@@ -128,7 +128,7 @@ def decide_and_next(game_id: str, person_index: int, accept: Optional[bool] = No
         try:
             resp = sess.get(url, params=params, timeout=10, verify=False)
             if resp.status_code == 429:
-                wait = min(300, 10 * (2 ** attempt))
+                wait = min(300, 10 * (2 ** attempt) * (0.8 + 0.4 * random.random()))
                 log(f"Rate limited, waiting {wait}s...")
                 time.sleep(wait)
                 return decide_and_next(game_id, person_index, accept, attempt + 1)
@@ -538,9 +538,16 @@ class StateManager:
     
     def _create_fresh_state(self) -> Dict:
         """Create fresh state structure"""
-        # Get K from actual game
-        game_data = new_game(self.scenario)
-        K = len(game_data['constraints'])
+        # Get K from actual game with fallback on API failure
+        try:
+            game_data = new_game(self.scenario)
+            K = len(game_data['constraints'])
+        except Exception as e:
+            log(f"API failed during fresh state creation: {e}")
+            # Use fallback K values based on known scenario constraints
+            fallback_K = {1: 2, 2: 4, 3: 6}
+            K = fallback_K.get(self.scenario, 2)
+            log(f"Using fallback K={K} for scenario {self.scenario}")
         
         # Create serializable search space representation (reduced dimensionality)
         search_space = []
@@ -895,18 +902,18 @@ class SmartBOOptimizer:
         
         # Check budget
         bo_evals = len(self.state.get('bo_evaluations', []))
-        if bo_evals >= 150:  # Increased budget for better convergence
+        if bo_evals >= 250:  # Increased budget for better convergence
             log("BO search budget exhausted, moving to validation")
             self.state['phase'] = 'validation'
             self._save_state_batch(force=True)
             return
         
         # Check for no improvement
-        if bo_evals > 30:  # Increased threshold before checking
-            recent_best = min([e['median'] for e in self.state['bo_evaluations'][-15:]])
+        if bo_evals > 75:  # Increased threshold before checking
+            recent_best = min([e['median'] for e in self.state['bo_evaluations'][-20:]])
             overall_best = self.state.get('global_best', float('inf'))
-            if recent_best > overall_best * 0.92:  # Tighter threshold for global search
-                log("No significant improvement in last 15 iterations, moving to validation")
+            if recent_best > overall_best * 0.97:  # Tighter threshold for global search
+                log("No significant improvement in last 20 iterations, moving to validation")
                 self.state['phase'] = 'validation'
                 self._save_state_batch(force=True)
                 return
@@ -933,11 +940,11 @@ class SmartBOOptimizer:
                 y0.append(eval_data['median'])
         
         # Determine how many new points to evaluate
-        n_points = min(self.workers, 150 - bo_evals)
+        n_points = min(self.workers, 250 - bo_evals)
         
         if not self.quiet:
             current_best = self.state.get('global_best', 'N/A')
-            log(f"\n📊 BO Search Progress: {bo_evals}/150 evaluations completed")
+            log(f"\n📊 BO Search Progress: {bo_evals}/250 evaluations completed")
             log(f"   Current best: {current_best} rejections")
             log(f"   Requesting {n_points} new points to evaluate...")
         
@@ -946,7 +953,7 @@ class SmartBOOptimizer:
         param_dicts = []
         
         for i in range(n_points):
-            if bo_evals + i >= 150:
+            if bo_evals + i >= 250:
                 break
                 
             # Run forest_minimize with current history
@@ -1397,9 +1404,9 @@ class SmartBOOptimizer:
                 bo_evals = len(self.state.get('bo_evaluations', []))
                 pending = len(self.pending_evaluations)
                 best_median = min([e['median'] for e in self.state['bo_evaluations']]) if self.state.get('bo_evaluations') else 'N/A'
-                eta_hours = (150 - bo_evals) / (games_per_hour / 3) if games_per_hour > 0 else 0  # 3 games per eval
+                eta_hours = (250 - bo_evals) / (games_per_hour / 3) if games_per_hour > 0 else 0  # 3 games per eval
                 
-                log(f"BO Search: {bo_evals}/150 evaluations (+{pending} pending) | "
+                log(f"BO Search: {bo_evals}/250 evaluations (+{pending} pending) | "
                     f"Best: {best_median} | "
                     f"ETA: {eta_hours:.1f}h | "
                     f"{games_per_hour:.1f} games/h")
