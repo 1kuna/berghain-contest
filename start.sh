@@ -136,6 +136,20 @@ else
     echo "  ✓ requests installed"
 fi
 
+if ! check_package skopt; then
+    MISSING_DEPS=true
+    echo "  ❌ scikit-optimize not installed"
+else
+    echo "  ✓ scikit-optimize installed"
+fi
+
+if ! check_package urllib3; then
+    MISSING_DEPS=true
+    echo "  ❌ urllib3 not installed"
+else
+    echo "  ✓ urllib3 installed"
+fi
+
 # Install missing dependencies
 if [ "$MISSING_DEPS" = true ]; then
     echo -e "\n${YELLOW}Installing missing dependencies...${NC}"
