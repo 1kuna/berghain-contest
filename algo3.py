@@ -182,20 +182,43 @@ def decide(
     
     # Compute weights dynamically from meta-parameters using inverse prior + dynamic risk
     
-    # Marginals (hardcoded per scenario or EMA; tuned for S3)
-    p_marg = np.array([0.65, 0.45, 0.3, 0.75]) if K == 4 else np.full(K, 0.5)  # Fallback for other scenarios
+    # Scenario-specific p_marg + EMA (Priority 1)
+    scenario = params.get('scenario', 1)
+    prior_p = np.full(K, 0.5)
+    if scenario == 1 and K == 2:  # Young/WD
+        prior_p = np.array([0.3225, 0.3225])
+    elif scenario == 2 and K == 4:  # Techno/Well/Creative/Local
+        prior_p = np.array([0.65, 0.45, 0.3, 0.75])
+    elif scenario == 3 and K == 6:  # UV/Int/FF/QF/VC/GS
+        prior_p = np.array([0.55, 0.50, 0.55, 0.25, 0.25, 0.65])
+    
+    # EMA from state (init zeros)
+    obs_counts = np.array(params.get('obs_counts', [0.0] * K))
+    obs_total = params.get('obs_total', 0)
+    obs_p = obs_counts / max(1, obs_total) if obs_total > 0 else np.zeros(K)
+    ema_alpha = params.get('ema_alpha', 0.3)
+    p_marg = (1 - ema_alpha) * prior_p + ema_alpha * obs_p
     exp_left = np.maximum(1.0, p_marg * max(S, 1))
     
-    # Inverse prior (smooth exp, clipped)
-    total_min = sum(c['minCount'] for c in constraints)
-    inv_base = np.array([total_min / (K * c['minCount']) for c in constraints])
-    inv_prior = np.clip(np.exp(params.get('weight_var', 1.0) * np.log(inv_base)), 0.5, 3.0)
+    # Milder inverse prior for hybrid (Priority 3)
+    minC_arr = np.array([c['minCount'] for c in constraints])
+    total_min = np.sum(minC_arr)
+    inv_prior = np.clip(np.mean(minC_arr) / np.maximum(1, minC_arr), 0.7, 1.6)
     weights = np.ones(K) * inv_prior
     
     # Dynamic risk (need/exp_left ^ beta)
     risk = needs / exp_left
-    beta = params.get('risk_beta', 1.0) * params['weight_var'] if 'weight_var' in params else params.get('risk_beta', 1.0)  # 0.5-1.5 range
+    beta = params.get('risk_beta', 1.0)
     weights *= np.clip(np.power(risk, beta), 0.4, 2.5)
+    
+    # Aggressive beta + hybrid weights (K>2 only, Priority 3)
+    if K > 2:
+        prop_weights = np.ones(K)
+        for i, c in enumerate(constraints):
+            adj = (c['minCount'] / total_min) - (1/K)
+            prop_weights[i] *= (1.0 + 0.5 * adj)
+        hybrid_alpha = params.get('hybrid_alpha', 0.3)
+        weights = (1 - hybrid_alpha) * weights + hybrid_alpha * prop_weights
     
     # Apply base scale
     weights *= params.get('weight_scale', 1.0)
@@ -207,21 +230,24 @@ def decide(
     alpha = params.get('overshoot_alpha', 0.8)
     weights *= 1.0 / (1.0 + alpha * proj_surplus)  # Downweight safe attributes
     
-    # Scarce guard (top-2 risk; tax if oversupplied + no cover)
+    # Stricter overshoot controls (top-3 + scaled tax, Priority 2)
     weighted_pressure = 0  # Initialize weighted_pressure
     if np.sum(needs > 0) > 0:
-        scarcity_idx = np.argsort(-risk)[:min(2, K)]
+        scarcity_idx = np.argsort(-risk)[:min(3, K)]  # Top-3 scarcity
         oversupplied = proj_surplus > params.get('overshoot_eps', 0.02)
         has_oversupplied = np.any(person_attrs & oversupplied)
         covers_scarce = np.any(person_attrs[scarcity_idx])
-        if has_oversupplied and not covers_scarce:
-            weighted_pressure += params.get('overshoot_tax', 0.05)  # Tax for oversupplied without scarce coverage
+        n_over = np.sum(person_attrs & oversupplied)
+        if has_oversupplied and not covers_scarce and n_over > 0:
+            tax_scale = n_over / max(1, np.sum(person_attrs))
+            multi_scarce_nudge = 1 + 0.02 * np.sum(needs > 0)
+            weighted_pressure += params.get('overshoot_tax', 0.1) * tax_scale * multi_scarce_nudge
     
     weighted_pressure += np.sum((needs[missing_mask] / max(S, EPS)) * weights[missing_mask])
     
     # Adjustments
     # Early game bonus
-    early_bonus = params.get('early_bonus', 0.0) if S >= params.get('early_threshold', 800) else 0.0
+    early_bonus = params.get('early_bonus', 0.0) if S >= params.get('early_threshold', 600) else 0.0
     
     # All-attributes bonus
     ab_bonus = 0.0
@@ -237,9 +263,9 @@ def decide(
     
     adjusted_pressure = weighted_pressure - early_bonus - ab_bonus
     
-    # Threshold ramp: stricter late in the game
+    # Threshold ramp: stricter late in the game (Priority 4)
     base_t = params['threshold']
-    ramp = params.get('threshold_ramp', 0.08)
+    ramp = params.get('threshold_ramp', 0.12)
     t = base_t + ramp * (1 - S / N)
     
     # Debug logging (controlled by debug parameter)
@@ -299,12 +325,28 @@ def run_game(args: Tuple[int, Dict]) -> Tuple[int, Dict]:
             if admitted >= N or rejected >= MAX_REJECTS:
                 break
         
+        # Update EMA observation counts for multi-scenario optimization
+        K = len(constraints)
+        obs_counts = np.array(params.get('obs_counts', [0.0] * K))
+        obs_total = params.get('obs_total', 0)
+        
+        # Add accepted counts to observations (proportional to admitted)
+        for i, c in enumerate(constraints):
+            attr = c['attribute']
+            obs_counts[i] += accepted_count.get(attr, 0)
+        obs_total += admitted
+        
+        # Update params with new observations
+        updated_params = params.copy()
+        updated_params['obs_counts'] = obs_counts.tolist()
+        updated_params['obs_total'] = obs_total
+        
         # Return results
         if resp['status'] == 'completed':
             final_rejected = resp.get('rejectedCount', rejected)
-            return final_rejected, params
+            return final_rejected, updated_params
         else:
-            return MAX_REJECTS, params
+            return MAX_REJECTS, updated_params
     
     except APIConnectionError:
         # Connection error - API is unreachable
@@ -316,34 +358,57 @@ def run_game(args: Tuple[int, Dict]) -> Tuple[int, Dict]:
 
 # ========== Bayesian Optimization Functions ==========
 def define_search_space(K: int) -> List:
-    """Define the search space for Bayesian Optimization (reduced dimensionality)"""
+    """Define the search space for Bayesian Optimization (enhanced dimensions)"""
     space = [
         Real(0.60, 1.00, name='threshold'),
         Real(0.0, 0.1, name='early_bonus'),
         Real(0.0, 0.2, name='ab_bonus'),
-        Integer(600, 900, name='early_threshold'),
+        Integer(500, 800, name='early_threshold'),  # Lowered range
         Real(0.5, 2.0, name='weight_scale'),  # Uniform scale for all weights
-        Real(0.5, 1.5, name='risk_beta'),  # Dynamic risk exponent
-        Real(0.5, 1.0, name='overshoot_alpha'),  # Overshoot penalty factor
-        Real(0.0, 0.1, name='threshold_ramp'),  # Threshold ramp factor
-        Real(0.0, 0.08, name='overshoot_tax'),  # Tax for oversupplied without scarce
-        Real(0.01, 0.05, name='overshoot_eps')  # Threshold for considering oversupplied
+        Real(0.8, 2.0, name='risk_beta'),  # Widened for nonlinear amplification
+        Real(0.7, 1.3, name='overshoot_alpha'),  # Wider range
+        Real(0.08, 0.15, name='threshold_ramp'),  # Steeper ramp range
+        Real(0.05, 0.15, name='overshoot_tax'),  # Higher tax range
+        Real(0.01, 0.03, name='overshoot_eps'),  # Tighter threshold
+        Real(0.1, 0.4, name='ema_alpha')  # EMA adaptation rate
     ]
     if K > 2:
-        space.append(Real(0.0, 1.0, name='weight_var'))  # Variance factor for differential weighting
+        space.append(Real(0.0, 0.5, name='hybrid_alpha'))  # Hybrid weight blending
     return space
 
 def create_objective_function(scenario: int, optimizer_instance):
     """Create the objective function for BO with variance handling"""
     @use_named_args(optimizer_instance.space)
     def objective(**params: Dict) -> float:
+        # Add scenario and obs state to params for multi-scenario optimization
+        params['scenario'] = scenario
+        params['obs_counts'] = optimizer_instance.state.get('obs_counts', [0.0] * len(optimizer_instance.state.get('search_space', [])))
+        params['obs_total'] = optimizer_instance.state.get('obs_total', 0)
+        if optimizer_instance.debug:
+            params['debug'] = True
+            
         num_runs = 3  # Base; increase if needed
         args = [(scenario, params) for _ in range(num_runs)]
         
         results = optimizer_instance._map_games(args)
-        # Filter out connection errors
+        # Filter out connection errors and accumulate observations
         all_results = [r[0] for r in results]
         valid_results = [r for r in all_results if r != CONNECTION_ERROR]
+        
+        # Accumulate observations from all valid runs for EMA
+        valid_params = [r[1] for r in results if r[0] != CONNECTION_ERROR]
+        if valid_params:
+            total_obs_counts = np.array(params.get('obs_counts', [0.0] * len(valid_params[0].get('obs_counts', []))))
+            total_obs_total = params.get('obs_total', 0)
+            
+            for p in valid_params:
+                if 'obs_counts' in p and 'obs_total' in p:
+                    total_obs_counts += np.array(p['obs_counts'])
+                    total_obs_total += p['obs_total']
+            
+            # Update optimizer state with accumulated observations
+            optimizer_instance.state['obs_counts'] = total_obs_counts.tolist()
+            optimizer_instance.state['obs_total'] = total_obs_total
         
         # Return inf if too many connection errors
         if len(valid_results) < 2:  # Need at least 2 valid results
@@ -361,6 +426,19 @@ def create_objective_function(scenario: int, optimizer_instance):
             # Filter connection errors from extra results
             all_extra = [r[0] for r in extra_results]
             valid_extra = [r for r in all_extra if r != CONNECTION_ERROR]
+            
+            # Accumulate extra observations
+            extra_params = [r[1] for r in extra_results if r[0] != CONNECTION_ERROR]
+            if extra_params and valid_params:
+                for p in extra_params:
+                    if 'obs_counts' in p and 'obs_total' in p:
+                        total_obs_counts += np.array(p['obs_counts'])
+                        total_obs_total += p['obs_total']
+                
+                # Update state with extra observations
+                optimizer_instance.state['obs_counts'] = total_obs_counts.tolist()
+                optimizer_instance.state['obs_total'] = total_obs_total
+                
             if valid_extra:
                 rejects = np.append(rejects, valid_extra)
         
@@ -376,7 +454,7 @@ def fallback_random_search(scenario: int, K: int, workers: int, n_calls: int = 2
     try:
         from scipy.stats import qmc
         # Use Latin Hypercube for better coverage
-        d = 10 + (1 if K > 2 else 0)  # Number of dimensions (5 original + 5 new parameters)
+        d = 11 + (1 if K > 2 else 0)  # Number of dimensions (enhanced parameter set)
         sampler = qmc.LatinHypercube(d=d)
         U = sampler.random(n_calls)  # Generate [0,1) samples
         
@@ -401,32 +479,36 @@ def fallback_random_search(scenario: int, K: int, workers: int, n_calls: int = 2
                 'threshold': scale(u[0], 0.60, 1.00),
                 'early_bonus': scale(u[1], 0.0, 0.1),
                 'ab_bonus': scale(u[2], 0.0, 0.2),
-                'early_threshold': scale(u[3], 600, 900, integer=True),
+                'early_threshold': scale(u[3], 500, 800, integer=True),
                 'weight_scale': scale(u[4], 0.5, 2.0),
-                'risk_beta': scale(u[5], 0.5, 1.5),
-                'overshoot_alpha': scale(u[6], 0.5, 1.0),
-                'threshold_ramp': scale(u[7], 0.0, 0.1),
-                'overshoot_tax': scale(u[8], 0.0, 0.08),
-                'overshoot_eps': scale(u[9], 0.01, 0.05)
+                'risk_beta': scale(u[5], 0.8, 2.0),
+                'overshoot_alpha': scale(u[6], 0.7, 1.3),
+                'threshold_ramp': scale(u[7], 0.08, 0.15),
+                'overshoot_tax': scale(u[8], 0.05, 0.15),
+                'overshoot_eps': scale(u[9], 0.01, 0.03),
+                'ema_alpha': scale(u[10], 0.1, 0.4),
+                'scenario': scenario
             }
             if K > 2:
-                params['weight_var'] = scale(u[10], 0.0, 1.0)
+                params['hybrid_alpha'] = scale(u[11], 0.0, 0.5)
         else:
             # Fallback to standard random sampling
             params = {
                 'threshold': np.random.uniform(0.60, 1.00),
                 'early_bonus': np.random.uniform(0.0, 0.1),
                 'ab_bonus': np.random.uniform(0.0, 0.2),
-                'early_threshold': np.random.randint(600, 901),
+                'early_threshold': np.random.randint(500, 801),
                 'weight_scale': np.random.uniform(0.5, 2.0),
-                'risk_beta': np.random.uniform(0.5, 1.5),
-                'overshoot_alpha': np.random.uniform(0.5, 1.0),
-                'threshold_ramp': np.random.uniform(0.0, 0.1),
-                'overshoot_tax': np.random.uniform(0.0, 0.08),
-                'overshoot_eps': np.random.uniform(0.01, 0.05)
+                'risk_beta': np.random.uniform(0.8, 2.0),
+                'overshoot_alpha': np.random.uniform(0.7, 1.3),
+                'threshold_ramp': np.random.uniform(0.08, 0.15),
+                'overshoot_tax': np.random.uniform(0.05, 0.15),
+                'overshoot_eps': np.random.uniform(0.01, 0.03),
+                'ema_alpha': np.random.uniform(0.1, 0.4),
+                'scenario': scenario
             }
             if K > 2:
-                params['weight_var'] = np.random.uniform(0.0, 1.0)
+                params['hybrid_alpha'] = np.random.uniform(0.0, 0.5)
         
         # Run games
         num_runs = 3
@@ -585,21 +667,22 @@ class StateManager:
             K = fallback_K.get(self.scenario, 2)
             log(f"Using fallback K={K} for scenario {self.scenario}")
         
-        # Create serializable search space representation (expanded dimensionality)
+        # Create serializable search space representation (enhanced dimensions)
         search_space = []
         search_space.append({'type': 'Real', 'low': 0.60, 'high': 1.00, 'name': 'threshold'})
         search_space.append({'type': 'Real', 'low': 0.0, 'high': 0.1, 'name': 'early_bonus'})
         search_space.append({'type': 'Real', 'low': 0.0, 'high': 0.2, 'name': 'ab_bonus'})
-        search_space.append({'type': 'Integer', 'low': 600, 'high': 900, 'name': 'early_threshold'})
+        search_space.append({'type': 'Integer', 'low': 500, 'high': 800, 'name': 'early_threshold'})
         search_space.append({'type': 'Real', 'low': 0.5, 'high': 2.0, 'name': 'weight_scale'})
-        search_space.append({'type': 'Real', 'low': 0.5, 'high': 1.5, 'name': 'risk_beta'})
-        search_space.append({'type': 'Real', 'low': 0.5, 'high': 1.0, 'name': 'overshoot_alpha'})
-        search_space.append({'type': 'Real', 'low': 0.0, 'high': 0.1, 'name': 'threshold_ramp'})
-        search_space.append({'type': 'Real', 'low': 0.0, 'high': 0.08, 'name': 'overshoot_tax'})
-        search_space.append({'type': 'Real', 'low': 0.01, 'high': 0.05, 'name': 'overshoot_eps'})
+        search_space.append({'type': 'Real', 'low': 0.8, 'high': 2.0, 'name': 'risk_beta'})
+        search_space.append({'type': 'Real', 'low': 0.7, 'high': 1.3, 'name': 'overshoot_alpha'})
+        search_space.append({'type': 'Real', 'low': 0.08, 'high': 0.15, 'name': 'threshold_ramp'})
+        search_space.append({'type': 'Real', 'low': 0.05, 'high': 0.15, 'name': 'overshoot_tax'})
+        search_space.append({'type': 'Real', 'low': 0.01, 'high': 0.03, 'name': 'overshoot_eps'})
+        search_space.append({'type': 'Real', 'low': 0.1, 'high': 0.4, 'name': 'ema_alpha'})
         
         if K > 2:
-            search_space.append({'type': 'Real', 'low': 0.0, 'high': 1.0, 'name': 'weight_var'})
+            search_space.append({'type': 'Real', 'low': 0.0, 'high': 0.5, 'name': 'hybrid_alpha'})
         
         return {
             'scenario': self.scenario,
@@ -613,7 +696,9 @@ class StateManager:
             'last_activity': time.time(),
             'start_time': time.time(),
             'total_games': 0,
-            'global_best': float('inf')
+            'global_best': float('inf'),
+            'obs_counts': [0.0] * K,  # EMA observation counts (serializable list)
+            'obs_total': 0  # Total observations for EMA
         }
 
 # ========== Smart Optimizer with BO ==========
@@ -656,6 +741,8 @@ class SmartBOOptimizer:
     
     def _signal_handler(self, signum, frame):
         """Handle shutdown signals"""
+        # Suppress unused parameter warnings - required by signal handler interface
+        _ = signum, frame
         self.shutdown_requested = True
         if self.pool:
             self.pool.terminate()
@@ -970,7 +1057,7 @@ class SmartBOOptimizer:
         """Determine current phase from state"""
         bo_evals = len(self.state.get('bo_evaluations', []))
         
-        if bo_evals < 150:  # Extended BO search phase
+        if bo_evals < 200:  # Extended BO search phase
             self.state['phase'] = 'bo_search'
         elif not self.state.get('champion'):
             self.state['phase'] = 'validation'
@@ -1068,28 +1155,28 @@ class SmartBOOptimizer:
         
         # Check budget
         bo_evals = len(self.state.get('bo_evaluations', []))
-        if bo_evals >= 150:  # Increased budget for better convergence
+        if bo_evals >= 200:  # Extended budget for better convergence
             log("BO search budget exhausted, moving to validation")
             self.state['phase'] = 'validation'
             self._save_state_batch(force=True)
             return
         
-        # Check for no improvement
-        if bo_evals > 30:  # Increased threshold before checking
+        # Check for no improvement (after 50 evals)
+        if bo_evals > 50:
             recent_best = min([e['median'] for e in self.state['bo_evaluations'][-15:]])
             overall_best = self.state.get('global_best', float('inf'))
-            if recent_best > overall_best * 0.92:  # Tighter threshold for global search
+            if recent_best > overall_best * 0.95:  # No-improvement threshold
                 log("No significant improvement in last 15 iterations, moving to validation")
                 self.state['phase'] = 'validation'
                 self._save_state_batch(force=True)
                 return
         
         # Determine how many new points to evaluate (aggressive batching)
-        n_points = min(self.workers * 3, 150 - bo_evals)  # More aggressive batching
+        n_points = min(self.workers * 3, 200 - bo_evals)  # More aggressive batching
         
         if not self.quiet:
             current_best = self.state.get('global_best', 'N/A')
-            log(f"\n📊 BO Search Progress: {bo_evals}/150 evaluations completed")
+            log(f"\n📊 BO Search Progress: {bo_evals}/200 evaluations completed")
             log(f"   Current best: {current_best} rejections")
             log(f"   Requesting {n_points} new points to evaluate...")
         
@@ -1324,9 +1411,9 @@ class SmartBOOptimizer:
             candidate_hash = hash(tuple(sorted(params.items())))
             
             # Check if we have progress for this candidate
-            progress = self.state['validation_progress'].get(str(candidate_hash), {'partial_runs': [], 'target': 15})
+            progress = self.state['validation_progress'].get(str(candidate_hash), {'partial_runs': [], 'target': 20})
             existing_runs = len(progress['partial_runs'])
-            remaining_runs = 15 - existing_runs
+            remaining_runs = 20 - existing_runs
             
             if not self.quiet and existing_runs > 0:
                 log(f"Resuming validation: {existing_runs} runs already completed, {remaining_runs} remaining")
@@ -1350,7 +1437,7 @@ class SmartBOOptimizer:
                 self._save_state_batch()
             
             # Check if we have enough runs to evaluate this candidate
-            if len(progress['partial_runs']) >= 15 or self.shutdown_requested:
+            if len(progress['partial_runs']) >= 20 or self.shutdown_requested:
                 # Use all available runs for statistics
                 final_runs = progress['partial_runs']
                 
@@ -1373,7 +1460,7 @@ class SmartBOOptimizer:
                 # Partial completion - will be resumed on next run
                 runs_completed = len(progress['partial_runs'])
                 if not self.quiet:
-                    log(f"Partial validation: {runs_completed}/{15} runs completed")
+                    log(f"Partial validation: {runs_completed}/{20} runs completed")
                 return  # Exit validation to resume later
         
         if validation_results and not self.shutdown_requested:
@@ -1450,7 +1537,7 @@ class SmartBOOptimizer:
                 )
                 
                 # Run 10 evaluations in trust region
-                for eval_num in range(10):
+                for _ in range(10):
                     if self.shutdown_requested:
                         break
                     
